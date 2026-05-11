@@ -150,6 +150,11 @@ def main():
     ap.add_argument("--batch-size", type=int, default=None,
                     help="override text_decoder.batch_size")
     ap.add_argument("--z-source", default=None, choices=["centroid", "modality"])
+    ap.add_argument("--resume", default=None,
+                    help="기존 run 디렉터리 경로. 지정 시 final.pt mapper를 로드해 "
+                         "ckpt 저장 시점 epoch 이후로 --epochs 만큼 추가 학습. "
+                         "config.json/기존 metrics/checkpoints/samples 모두 보존. "
+                         "Optimizer state는 ckpt에 없어 AdamW 모멘트는 0부터 재시작.")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -167,14 +172,44 @@ def main():
 
     cache_dir = resolve_path(cfg["cache_dir"], HERE)
     runs_root = resolve_path(cfg["runs_root"], HERE)
-    run_name = build_run_name(text_cfg, suffix="txt")
-    run_dir = runs_root / run_name
-    ckpt_dir = run_dir / "checkpoints"
-    sample_dir = run_dir / "samples"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    sample_dir.mkdir(parents=True, exist_ok=True)
-    with open(run_dir / "config.json", "w") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+    # Resume: 기존 run_dir 재사용, config/metrics/checkpoints 모두 보존.
+    start_epoch = 0
+    resume_ckpt = None
+    metrics_log: list[dict] = []
+    if args.resume:
+        run_dir = resolve_path(args.resume, HERE)
+        ckpt_dir = run_dir / "checkpoints"
+        sample_dir = run_dir / "samples"
+        final_pt = ckpt_dir / "final.pt"
+        if not final_pt.exists():
+            raise FileNotFoundError(f"resume: {final_pt} 없음")
+        resume_ckpt = torch.load(final_pt, map_location="cpu", weights_only=False)
+        start_epoch = int(resume_ckpt["epoch"])
+        # 기존 final.pt 백업 (덮어쓰기 전).
+        backup_path = ckpt_dir / f"final_epoch_{start_epoch:03d}.pt"
+        if not backup_path.exists():
+            import shutil
+            shutil.copy2(final_pt, backup_path)
+            print(f"[resume] backed up final.pt → {backup_path.name}")
+        # 기존 metrics 로드 — 새 epoch 결과는 append.
+        metrics_json = run_dir / "metrics.json"
+        if metrics_json.exists():
+            with open(metrics_json) as f:
+                metrics_log = json.load(f)
+        run_name = run_dir.name + "_resume"
+        print(f"[resume] from epoch {start_epoch}, will train "
+              f"{text_cfg['epochs']} more epoch(s) → target epoch "
+              f"{start_epoch + text_cfg['epochs']}")
+    else:
+        run_name = build_run_name(text_cfg, suffix="txt")
+        run_dir = runs_root / run_name
+        ckpt_dir = run_dir / "checkpoints"
+        sample_dir = run_dir / "samples"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        with open(run_dir / "config.json", "w") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
     print(f"[run] {run_dir}")
 
     # WandB
@@ -223,6 +258,10 @@ def main():
         lm_dtype=text_cfg.get("lm_dtype", "auto"),
     ).to(device)
 
+    if resume_ckpt is not None:
+        model.mapper.load_state_dict(resume_ckpt["mapper"])
+        print(f"[resume] mapper loaded from final.pt (saved epoch={start_epoch})")
+
     n_train = sum(p.numel() for p in model.mapper.parameters())
     n_lm = sum(p.numel() for p in model.lm.parameters())
     print(f"[model] mapper trainable={n_train/1e6:.2f}M, LM frozen={n_lm/1e6:.2f}M, "
@@ -266,16 +305,17 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=(precision == "fp16" and use_amp))
     print(f"[precision] {precision}{' (AMP)' if use_amp else ' (no AMP)'}")
 
-    metrics_log: list[dict] = []
     global_step = 0
     steps_per_epoch = len(train_loader)
+    # 비-resume 시 start_epoch=0이라 total_epochs == text_cfg["epochs"] (기존 동작과 동일).
+    total_epochs = start_epoch + text_cfg["epochs"]
 
     # ------------------------------------------------------------------
     # Train
-    for epoch in range(text_cfg["epochs"]):
+    for epoch in range(start_epoch, total_epochs):
         model.train()
         running_loss, running_n = 0.0, 0
-        pbar = tqdm(train_loader, desc=f"ep{epoch+1}/{text_cfg['epochs']}")
+        pbar = tqdm(train_loader, desc=f"ep{epoch+1}/{total_epochs}")
         for z, input_ids, attn in pbar:
             z = z.to(device, non_blocking=True)
             input_ids = input_ids.to(device, non_blocking=True)
@@ -338,13 +378,13 @@ def main():
                 tbl.add_data(epoch + 1, gt, gen)
             wandb.log({"samples/captions": tbl}, step=global_step)
 
-        if (epoch + 1) % text_cfg["save_every_n_epochs"] == 0 or (epoch + 1) == text_cfg["epochs"]:
+        if (epoch + 1) % text_cfg["save_every_n_epochs"] == 0 or (epoch + 1) == total_epochs:
             torch.save({"mapper": model.mapper.state_dict(),
                         "epoch": epoch + 1, "config": cfg},
                        ckpt_dir / f"epoch_{epoch+1:03d}.pt")
 
     torch.save({"mapper": model.mapper.state_dict(),
-                "epoch": text_cfg["epochs"], "config": cfg},
+                "epoch": total_epochs, "config": cfg},
                ckpt_dir / "final.pt")
     wandb.finish()
     print(f"\n[done] saved to {run_dir}")

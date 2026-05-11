@@ -74,7 +74,13 @@ python Code/SemComm/train_text_decoder.py \
     --epochs 2 \
     --batch-size 32 \
     --z-source centroid
+
+python Code/SemComm/train_text_decoder.py \
+  --resume runs/txt_centroid_bs64_lr2e-05_K10_20260510-150610 \
+  --epochs 5
 ```
+
+
 
 LM은 frozen, mapper(111M)만 학습. 최초 실행 시 ~1.2GB 가중치 자동 다운로드.
 
