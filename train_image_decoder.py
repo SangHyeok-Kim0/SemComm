@@ -39,9 +39,20 @@ from models import ImageDecoder  # noqa: E402
 # ---------------------------------------------------------------------------
 # Helpers
 
-def load_config(path: str) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
+def load_config(base_path: str, decoder_path: str | None = None) -> dict:
+    """Load base config (config.yaml) and optionally deep-merge a decoder-specific config
+    (e.g. config_convt.yaml or config_diffusion.yaml) into it."""
+    with open(base_path) as f:
+        cfg = yaml.safe_load(f)
+    if decoder_path:
+        with open(decoder_path) as f:
+            override = yaml.safe_load(f) or {}
+        for k, v in override.items():
+            if k in cfg and isinstance(cfg[k], dict) and isinstance(v, dict):
+                cfg[k] = {**cfg[k], **v}
+            else:
+                cfg[k] = v
+    return cfg
 
 
 def resolve_path(p: str, base: Path) -> Path:
@@ -159,7 +170,10 @@ def evaluate(model: ImageDecoder, loader: DataLoader, device: torch.device,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default=str(HERE / "config.yaml"))
+    ap.add_argument("--config", default=str(HERE / "config.yaml"),
+                    help="base config (encoder/data/wandb/text_decoder)")
+    ap.add_argument("--decoder-config", default=str(HERE / "config_convt.yaml"),
+                    help="image_decoder config (ConvT v1 default)")
     ap.add_argument("--max-train-images", type=int, default=None,
                     help="cap train images for sanity dry-run")
     ap.add_argument("--epochs", type=int, default=None,
@@ -168,7 +182,7 @@ def main():
                     help="override config.z_source")
     args = ap.parse_args()
 
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, args.decoder_config)
     img_cfg = cfg["image_decoder"]
     if args.epochs is not None:
         img_cfg["epochs"] = args.epochs

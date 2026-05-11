@@ -1,9 +1,10 @@
 """Decoder models for SemComm.
 
-  ImageDecoder        z (B, 1024) -> image (B, 3, 224, 224) in [-1, 1]
-  TransformerMapper   z (B, 1024) -> prefix tokens (B, K, d_model)   (ClipCap-style)
-  MLPMapper           same I/O, simpler alternative
-  TextDecoder         frozen Qwen3-0.6B-Base + mapper, exposes forward (CE) and generate
+  ImageDecoder            z (B, 1024) -> image (B, 3, 224, 224) in [-1, 1]
+  DiffusionImageDecoder   SD 1.5 VAE+UNet(LoRA) decoder with z + caption dual conditioning
+  TransformerMapper       z (B, 1024) -> prefix tokens (B, K, d_model)   (ClipCap-style)
+  MLPMapper               same I/O, simpler alternative
+  TextDecoder             frozen Qwen3-0.6B-Base + mapper, exposes forward (CE) and generate
 
 Inputs are assumed already unit-norm (encoder side ensures this).
 """
@@ -14,6 +15,7 @@ import re
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # 학습 시 EOS를 못 본 모델은 max_new_tokens 끝까지 채우며 LM pretraining 패턴
@@ -55,6 +57,151 @@ class ImageDecoder(nn.Module):
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         h = self.proj(z).view(z.size(0), self.hidden_init, 7, 7)
         return self.deconv(h)
+
+
+# ---------------------------------------------------------------------------
+# Diffusion image decoder (SD 1.5 VAE + LoRA UNet, dual conditioning: z + caption)
+
+class DiffusionImageDecoder(nn.Module):
+    """Stable Diffusion 1.5 backbone with LoRA-fine-tuned UNet for SemComm.
+
+    Conditioning is dual: 1024-D semantic vector z is projected to K virtual
+    tokens (shape (B, K, 768)), optionally concatenated with caption tokens from
+    the SD CLIP-L text encoder (shape (B, 77, 768)). The concatenated sequence
+    feeds UNet cross-attention.
+
+    Trainable parameters: LoRA on UNet cross-attention (to_k/v/q/out.0) and the
+    projection MLP (`z_proj`). VAE, text encoder, and base UNet stay frozen.
+
+    Caption stream can be disabled at construction time (caption_conditioning=False)
+    for the M3-ablation cell — z tokens alone are then used.
+    """
+
+    SD_DEFAULT = "stable-diffusion-v1-5/stable-diffusion-v1-5"
+
+    def __init__(
+        self,
+        sd_model_id: str = SD_DEFAULT,
+        z_dim: int = 1024,
+        n_z_tokens: int = 10,
+        lora_rank: int = 8,
+        lora_alpha: int = 16,
+        caption_conditioning: bool = True,
+        dtype: torch.dtype = torch.float16,
+    ):
+        super().__init__()
+        from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler
+        from transformers import CLIPTextModel, CLIPTokenizer
+        from peft import LoraConfig, get_peft_model
+
+        self.sd_model_id = sd_model_id
+        self.z_dim = z_dim
+        self.n_z_tokens = n_z_tokens
+        self.caption_conditioning = caption_conditioning
+        self.dtype = dtype
+
+        self.vae = AutoencoderKL.from_pretrained(sd_model_id, subfolder="vae", torch_dtype=dtype)
+        self.text_encoder = CLIPTextModel.from_pretrained(sd_model_id, subfolder="text_encoder", torch_dtype=dtype)
+        self.tokenizer = CLIPTokenizer.from_pretrained(sd_model_id, subfolder="tokenizer")
+        self.scheduler = DDPMScheduler.from_pretrained(sd_model_id, subfolder="scheduler")
+        unet = UNet2DConditionModel.from_pretrained(sd_model_id, subfolder="unet", torch_dtype=dtype)
+
+        for p in self.vae.parameters():
+            p.requires_grad = False
+        for p in self.text_encoder.parameters():
+            p.requires_grad = False
+        for p in unet.parameters():
+            p.requires_grad = False
+        self.vae.eval()
+        self.text_encoder.eval()
+
+        lora_config = LoraConfig(
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            target_modules=["to_k", "to_v", "to_q", "to_out.0"],
+        )
+        self.unet = get_peft_model(unet, lora_config)
+
+        self.cross_attn_dim = unet.config.cross_attention_dim  # 768 for SD 1.5
+        self.z_proj = nn.Sequential(
+            nn.Linear(z_dim, 2048),
+            nn.GELU(),
+            nn.Linear(2048, n_z_tokens * self.cross_attn_dim),
+        )
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # Keep frozen modules in eval mode regardless of train()/eval() on parent.
+        self.vae.eval()
+        self.text_encoder.eval()
+        return self
+
+    def trainable_parameters(self):
+        """Iterator over LoRA + projection parameters."""
+        for p in self.unet.parameters():
+            if p.requires_grad:
+                yield p
+        for p in self.z_proj.parameters():
+            yield p
+
+    def encode_caption(self, captions: list[str]) -> torch.Tensor:
+        """Encode caption strings to SD text embeddings (B, 77, 768)."""
+        device = next(self.text_encoder.parameters()).device
+        tok = self.tokenizer(captions, padding="max_length", max_length=77,
+                             truncation=True, return_tensors="pt").to(device)
+        with torch.no_grad():
+            return self.text_encoder(input_ids=tok.input_ids,
+                                     attention_mask=tok.attention_mask).last_hidden_state
+
+    def project_z(self, z: torch.Tensor) -> torch.Tensor:
+        """z (B, 1024) -> z_tokens (B, K, 768) in self.dtype."""
+        B = z.size(0)
+        tokens = self.z_proj(z).view(B, self.n_z_tokens, self.cross_attn_dim)
+        return tokens.to(self.dtype)
+
+    def build_condition(self, z: torch.Tensor, captions: list[str] | None) -> torch.Tensor:
+        """Build cross-attention condition. (B, K, 768) or (B, K+77, 768)."""
+        z_tokens = self.project_z(z)
+        if not self.caption_conditioning or captions is None:
+            return z_tokens
+        cap_tokens = self.encode_caption(captions)
+        return torch.cat([z_tokens, cap_tokens], dim=1)
+
+    @torch.no_grad()
+    def encode_image_to_latent(self, x: torch.Tensor) -> torch.Tensor:
+        """Pixel image (B,3,H,W) in [-1,1] -> VAE latent (B,4,H/8,W/8)."""
+        return self.vae.encode(x.to(self.dtype)).latent_dist.sample() * self.vae.config.scaling_factor
+
+    @torch.no_grad()
+    def decode_latent_to_image(self, latent: torch.Tensor) -> torch.Tensor:
+        """VAE latent -> pixel image (B,3,H,W) in [-1,1]."""
+        latent = latent.to(self.dtype) / self.vae.config.scaling_factor
+        return self.vae.decode(latent).sample
+
+    def training_step(self, x: torch.Tensor, z: torch.Tensor,
+                      captions: list[str] | None = None,
+                      cond_drop_prob: float = 0.1) -> torch.Tensor:
+        """One training step. Returns ε-prediction MSE loss in VAE latent space.
+
+        cond_drop_prob: classifier-free guidance support — fraction of samples
+        whose condition is dropped (zeroed). Applied per-sample.
+        """
+        latent = self.encode_image_to_latent(x)
+        noise = torch.randn_like(latent)
+        bsz = latent.size(0)
+        timesteps = torch.randint(0, self.scheduler.config.num_train_timesteps,
+                                  (bsz,), device=latent.device).long()
+        noisy_latent = self.scheduler.add_noise(latent, noise, timesteps)
+
+        cond = self.build_condition(z, captions)
+        if cond_drop_prob > 0:
+            drop_mask = (torch.rand(bsz, device=latent.device) < cond_drop_prob)
+            if drop_mask.any():
+                cond = cond.clone()
+                cond[drop_mask] = 0.0
+
+        eps_pred = self.unet(noisy_latent, timesteps, encoder_hidden_states=cond).sample
+        return F.mse_loss(eps_pred.float(), noise.float())
 
 
 # ---------------------------------------------------------------------------

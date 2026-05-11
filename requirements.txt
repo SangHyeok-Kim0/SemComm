@@ -1,0 +1,7 @@
+# SemComm dependencies on top of ../ModalityGap/requirements.txt
+# Install: pip install -r ../ModalityGap/requirements.txt -r requirements.txt
+diffusers>=0.27
+peft>=0.10
+accelerate>=1.0
+clean-fid>=0.1.35
+lpips

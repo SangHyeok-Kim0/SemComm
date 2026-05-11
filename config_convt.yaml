@@ -1,0 +1,26 @@
+# Image decoder v1 — ConvTranspose baseline.
+# 사용: python train_image_decoder.py --config config.yaml --decoder-config config_convt.yaml
+#
+# Baseline은 Stable Diffusion VAE / VQGAN 관습 따름 — MSE 단독은 blurry,
+# LPIPS dominant로 perceptual quality 확보.
+
+image_decoder:
+  # Training
+  z_source: "modality"               # centroid | modality | random_img_txt
+  batch_size: 256                    # GB10 130GB라 더 키워도 되지만, ConvT는 data loader가 bottleneck
+  epochs: 30                         # 118k images / 256 = ~462 step/ep → 30ep ≈ 14k step
+  learning_rate: 1.0e-4              # AdamW 일반적 baseline (28M params 디코더에 안전)
+  weight_decay: 0.01                 # AdamW 표준 (HF Trainer default)
+  seed: 42
+  device_id: 0
+  precision: "bf16"                  # fp32 | fp16 | bf16 (Blackwell에서 bf16 native)
+  num_workers: 4
+  save_every_n_epochs: 5
+  run_name: "auto"                   # auto/null/"" → 자동 생성, 문자열이면 그대로
+
+  # ConvT architecture & loss
+  hidden_init: 512                   # 첫 ConvT 입력 채널 (7x7xH 로 시작)
+  mse_weight: 1.0                    # pixel anchor
+  l1_weight: 0.0                     # MSE+L1 중복 효과 작음 → 0 (필요시 0.1로)
+  lpips_weight: 5.0                  # SD VAE 관습 (≈1.0); CLIP feature는 추상적이라 perceptual 우선. 0.0이면 LPIPS 미로드.
+  lpips_net: "alex"                  # alex | vgg | squeeze. alex가 vgg 대비 ~5x faster, perceptual 품질 동등 (Zhang+2018 Table 5).

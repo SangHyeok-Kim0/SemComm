@@ -1,0 +1,37 @@
+# Image decoder v2 — Stable Diffusion 1.5 VAE + LoRA UNet + dual conditioning.
+# 사용: python train_image_decoder_v2.py --config config.yaml --decoder-config config_diffusion.yaml
+#
+# - z (1024-D) → projection MLP → K virtual tokens (B, K, 768)
+# - caption ĉ (M3, optional) → SD CLIP-L text encoder → (B, 77, 768)
+# - 두 token sequence concat → UNet cross-attention input
+# - Trainable: UNet cross-attn LoRA + projection MLP만 (VAE/text encoder/base UNet frozen)
+# - Loss: ε-prediction MSE in VAE latent space
+
+image_decoder:
+  # Training
+  z_source: "random_img_txt"         # centroid | modality | random_img_txt (proposed: random_img_txt)
+  batch_size: 16                     # SD UNet은 ConvT보다 활성 메모리 큼 — BS 16~32 권장
+  epochs: 10                         # 50k step ≈ 수렴. caption curriculum 5 + cached ĉ 5 epoch
+  learning_rate: 1.0e-4              # LoRA 표준 (Hu+2022). LoRA rank 8에서 안정.
+  weight_decay: 0.01                 # AdamW decoupled WD
+  seed: 42
+  device_id: 0
+  precision: "bf16"                  # fp16은 SD VAE에서 NaN 위험 — bf16 권장
+  num_workers: 4
+  save_every_n_epochs: 2
+  run_name: "auto"
+
+  # Caption stream (M3) — text decoder dependency 추적용.
+  # text_decoder_run이 비어있으면 caption stream OFF (= M3 off cell, z만 conditioning).
+  # 비어있지 않으면 encode_captions.py가 생성한 cache/captions_{text_decoder_run}_{split}_{zkind}.pt를 로드.
+  # 학습 run의 config.json에 자동 기록되어 어떤 text decoder에 의존했는지 사후 추적 가능.
+  text_decoder_run: "txt_centroid_bs64_lr2e-05_K10_20260510-150610"               # 예: "txt_centroid_bs64_lr2e-05_K10_20260510-150610" (파일럿)
+                                     #     또는 "txt_random_img_txt_..." (재학습 후 권장)
+  caption_curriculum_epochs: 5       # 처음 N epoch는 GT caption 사용, 이후 cached ĉ로 swap (0이면 즉시 ĉ)
+
+  # SD-LoRA architecture
+  lora_rank: 8                       # SD UNet LoRA rank. 8이 stable, 4로 줄여 학습 시간 절반.
+  n_z_tokens: 10                     # z 1024-D를 K virtual tokens × 768-D로 project (cross-attn input).
+  cond_drop_prob: 0.1                # classifier-free guidance 위한 학습 시 condition drop 확률.
+  sample_steps: 30                   # validation sample inference DDIM step 수.
+  cfg_scale_sample: 1.0              # inference 시 CFG scale (1.0 = guidance 없음, 3.0~7.5 권장 in ablation).

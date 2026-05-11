@@ -6,8 +6,12 @@ train_text_decoder.py 와 동일한 학습 파이프라인이지만, collate에�
 흘렸음 — 그쪽은 inference-time post-process(_clean_caption)로 우회.
 
   z source policy:
-    centroid: mu = normalize((z_img[i] + z_txt[j]) / 2) for caption j with parent image i
-    modality: z = z_txt[j]   (image-text 짝의 caption 측 임베딩만 사용)
+    centroid:       mu = normalize((z_img[i] + z_txt[j]) / 2) for caption j with parent image i
+    modality:       z = z_txt[j]   (image-text 짝의 caption 측 임베딩만 사용)
+    random_img_txt: per-sample 50/50 — z = z_img[i] or z = z_txt[j].
+                    GT는 항상 caption_texts[j]. caption-wise iteration이라
+                    한 image의 5 captions 각각이 별도 sample로 노출되어 image-side
+                    선택 시 자연스럽게 one-to-many supervision이 발생.
 
 LM is frozen (cfg.text_decoder.freeze_lm). Only the mapper updates.
 
@@ -64,7 +68,7 @@ class TextDecoderDataset(Dataset):
 
     def __init__(self, caption_image_idx: list[int], caption_texts: list[str],
                  z_img: torch.Tensor, z_txt: torch.Tensor, z_source: str):
-        assert z_source in ("centroid", "modality")
+        assert z_source in ("centroid", "modality", "random_img_txt")
         assert len(caption_image_idx) == len(caption_texts) == z_txt.size(0)
         self.caption_image_idx = caption_image_idx
         self.caption_texts = caption_texts
@@ -80,6 +84,13 @@ class TextDecoderDataset(Dataset):
         z_t = self.z_txt[j].float()
         if self.z_source == "modality":
             z = z_t
+        elif self.z_source == "random_img_txt":
+            # torch.rand: DataLoader worker마다 자동으로 seed 분리됨 (random/numpy는 명시 필요).
+            if torch.rand(1).item() < 0.5:
+                im_idx = self.caption_image_idx[j]
+                z = self.z_img[im_idx].float()
+            else:
+                z = z_t
         else:  # centroid
             im_idx = self.caption_image_idx[j]
             z_v = self.z_img[im_idx].float()
@@ -161,7 +172,8 @@ def main():
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--batch-size", type=int, default=None,
                     help="override text_decoder.batch_size")
-    ap.add_argument("--z-source", default=None, choices=["centroid", "modality"])
+    ap.add_argument("--z-source", default=None,
+                    choices=["centroid", "modality", "random_img_txt"])
     args = ap.parse_args()
 
     cfg = load_config(args.config)
