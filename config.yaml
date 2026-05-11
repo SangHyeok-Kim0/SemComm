@@ -1,0 +1,86 @@
+# SemComm decoder training config (Phase B).
+# 사용 자산: ModalityGap Run 1 (RN50, BS128, lr1e-4, 100ep, Tfix, fp16, 제안 loss)
+#
+# 구조:
+#   상단 — encoder/데이터 경로/wandb (둘 다 공유)
+#   encode — 임베딩 캐시 단계 (encode_dataset.py만 사용)
+#   image_decoder / text_decoder — 디코더별 모든 hparam 독립 설정
+#
+# train_image_decoder.py 는 cfg["image_decoder"]만,
+# train_text_decoder.py  는 cfg["text_decoder"]만 읽는다.
+
+# ---------- 공유: 인코더 / 데이터 / wandb ----------
+encoder_run: "bs128_lr1e-4_ep100_Tfix_fp16_a50-50_b20-50_20260505-034844"
+encoder_model: "RN50"                # open_clip 모델 이름 (Run 1과 일치)
+encoder_ckpt_filename: "final.pt"    # ModalityGap runs/<run>/checkpoints/<filename>
+
+coco_root: "../ModalityGap/data/coco"
+cache_dir: "cache"
+runs_root: "runs"
+
+wandb:
+  enabled: true
+  project: "SemCom"
+  entity: null                       # null이면 default entity
+  log_samples_every_n_epochs: 2      # 이미지/캡션 샘플 로깅 주기
+
+# ---------- Encode 단계 (1회 캐시) ----------
+encode:
+  batch_size: 256
+  num_workers: 4
+  device_id: 0
+  precision: "fp32"                  # fp32 | fp16 | bf16. 단발 추론이라 fp32 권장 (cache는 항상 fp16 저장)
+
+# ---------- Image Decoder ----------
+# Baseline은 Stable Diffusion VAE / VQGAN 관습 따름 — MSE 단독은 blurry,
+# LPIPS dominant로 perceptual quality 확보.
+image_decoder:
+  # Training
+  z_source: "modality"               # centroid | modality
+  batch_size: 256                    # GB10 130GB라 더 키워도 되지만, ConvT는 data loader가 bottleneck
+  epochs: 30                         # 118k images / 256 = ~462 step/ep → 30ep ≈ 14k step
+  learning_rate: 1.0e-4              # AdamW 일반적 baseline (28M params 디코더에 안전)
+  weight_decay: 0.01                 # AdamW 표준 (HF Trainer default)
+  seed: 42
+  device_id: 0
+  precision: "bf16"                  # fp32 | fp16 | bf16 (Blackwell에서 bf16 native)
+  num_workers: 4
+  save_every_n_epochs: 5
+  run_name: "auto"                   # auto/null/"" → 자동 생성, 문자열이면 그대로
+
+  # Architecture & loss
+  hidden_init: 512                   # 첫 ConvT 입력 채널 (7x7xH 로 시작)
+  mse_weight: 1.0                    # pixel anchor
+  l1_weight: 0.0                     # MSE+L1 중복 효과 작음 → 0 (필요시 0.1로)
+  lpips_weight: 5.0                  # SD VAE 관습 (≈1.0); CLIP feature는 추상적이라 perceptual 우선. 0.0이면 LPIPS 미로드.
+  lpips_net: "alex"                  # alex | vgg | squeeze. alex가 vgg 대비 ~5x faster, perceptual 품질 동등 (Zhang+2018 Table 5).
+
+# ---------- Text Decoder ----------
+# Baseline은 ClipCap (Mokady et al., CVPR 2022 Workshop) 그대로 차용.
+# frozen LM + Transformer mapper 조합은 lr 작게(2e-5)가 standard — 큰 lr은 mapper 발산 위험.
+text_decoder:
+  # Training
+  z_source: "centroid"               # centroid | modality
+  batch_size: 64                     # ClipCap=40, GB10에선 64로 약간 상향. 더 키워도 됨.
+  epochs: 15                         # ClipCap default. 591k caps × 10 = 5.9M passes (충분)
+  learning_rate: 2.0e-5              # ClipCap baseline. frozen LM에선 1e-4는 too large.
+  weight_decay: 0.01                 # AdamW decoupled WD. ClipCap은 0이지만 mild reg 유익.
+  seed: 42
+  device_id: 0
+  precision: "bf16"                  # fp32 | fp16 | bf16. mapper(fp32 master) 연산을 amp_dtype로 cast. fp32면 autocast 비활성.
+  num_workers: 4
+  save_every_n_epochs: 2             # epochs 짧아진 만큼 빈도 ↑
+  run_name: "auto"
+
+  # Architecture & generation
+  lm_name: "Qwen/Qwen3-0.6B-Base"
+  freeze_lm: true
+  lm_dtype: "auto"                   # auto | float32 | float16 | bfloat16
+  prefix_len: 10                     # K — ClipCap transformer mapper default
+  mapper_type: "transformer"         # transformer | mlp (frozen LM이면 transformer 권장)
+  mapper_layers: 8                   # ClipCap default
+  mapper_heads: 8                    # ClipCap default
+  mapper_dropout: 0.1                # ClipCap default
+  beam_size: 5                       # ClipCap inference default
+  max_new_tokens: 30                 # COCO caption 평균 ~11 token, 30이면 충분
+  caption_max_tokens: 40             # ClipCap=40. COCO 95th-percentile ~25 token.
