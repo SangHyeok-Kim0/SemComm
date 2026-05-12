@@ -47,12 +47,13 @@ def resolve_path(p: str, base: Path) -> Path:
     return pp if pp.is_absolute() else (base / pp).resolve()
 
 
-def build_run_name(d_cfg: dict, suffix: str) -> str:
+def build_run_name(d_cfg: dict, suffix: str, name_suffix: str = "") -> str:
     if d_cfg.get("run_name") and d_cfg["run_name"] not in ("auto", "null", ""):
         return d_cfg["run_name"]
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    extra = f"_{name_suffix}" if name_suffix else ""
     return (f"{suffix}_{d_cfg['z_source']}_bs{d_cfg['batch_size']}"
-            f"_lr{d_cfg['learning_rate']}_K{d_cfg['prefix_len']}_{ts}")
+            f"_lr{d_cfg['learning_rate']}_K{d_cfg['prefix_len']}{extra}_{ts}")
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +168,10 @@ def main():
                          "ckpt 저장 시점 epoch 이후로 --epochs 만큼 추가 학습. "
                          "config.json/기존 metrics/checkpoints/samples 모두 보존. "
                          "Optimizer state는 ckpt에 없어 AdamW 모멘트는 0부터 재시작.")
+    ap.add_argument("--cache-dir", default=None,
+                    help="override cfg['cache_dir']. Stage 2 (Standard CLIP) 시 사용.")
+    ap.add_argument("--run-name-suffix", default="",
+                    help="run_name 에 붙일 suffix (예: 'std_clip'). cache 종류 추적용.")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -182,8 +187,9 @@ def main():
     torch.manual_seed(text_cfg["seed"])
     device = torch.device(f"cuda:{text_cfg['device_id']}" if torch.cuda.is_available() else "cpu")
 
-    cache_dir = resolve_path(cfg["cache_dir"], HERE)
+    cache_dir = resolve_path(args.cache_dir if args.cache_dir else cfg["cache_dir"], HERE)
     runs_root = resolve_path(cfg["runs_root"], HERE)
+    print(f"[cache_dir] {cache_dir}")
 
     # Resume: 기존 run_dir 재사용, config/metrics/checkpoints 모두 보존.
     start_epoch = 0
@@ -214,7 +220,7 @@ def main():
               f"{text_cfg['epochs']} more epoch(s) → target epoch "
               f"{start_epoch + text_cfg['epochs']}")
     else:
-        run_name = build_run_name(text_cfg, suffix="txt")
+        run_name = build_run_name(text_cfg, suffix="txt", name_suffix=args.run_name_suffix)
         run_dir = runs_root / run_name
         ckpt_dir = run_dir / "checkpoints"
         sample_dir = run_dir / "samples"

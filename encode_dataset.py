@@ -44,26 +44,38 @@ def resolve_path(p: str, base: Path) -> Path:
     return pp if pp.is_absolute() else (base / pp).resolve()
 
 
-def load_encoder(cfg: dict, device: torch.device):
-    """Load Run 1's open_clip model, strip DataParallel prefix, freeze."""
+def load_encoder(cfg: dict, device: torch.device, mode: str = "run1"):
+    """Load encoder.
+      mode='run1': ModalityGap-trained ckpt (cfg['encoder_run']) — gap-closed.
+      mode='standard_clip': OpenAI pretrained vanilla CLIP — large modality gap (Stage 2 baseline).
+    """
     model_name = cfg["encoder_model"]
-    ckpt_path = (
-        MODGAP / "runs" / cfg["encoder_run"] / "checkpoints" / cfg["encoder_ckpt_filename"]
-    )
+    if mode == "standard_clip":
+        # OpenAI pretrained — no local ckpt, downloaded by open_clip automatically.
+        model, _, _ = open_clip.create_model_and_transforms(
+            model_name, pretrained="openai", device=device
+        )
+        print(f"[encoder] {model_name} loaded from OpenAI pretrained (Stage 2 baseline)")
+    elif mode == "run1":
+        ckpt_path = (
+            MODGAP / "runs" / cfg["encoder_run"] / "checkpoints" / cfg["encoder_ckpt_filename"]
+        )
+        model, _, _ = open_clip.create_model_and_transforms(
+            model_name, pretrained=None, device=device
+        )
+        state = torch.load(ckpt_path, map_location=device, weights_only=False)
+        if any(k.startswith("module.") for k in state):
+            state = {k[len("module."):]: v for k, v in state.items()}
+        model.load_state_dict(state)
+        print(f"[encoder] {model_name} loaded from {ckpt_path}")
+    else:
+        raise ValueError(f"Unknown encoder mode: {mode!r}")
 
-    model, _, _ = open_clip.create_model_and_transforms(
-        model_name, pretrained=None, device=device
-    )
-    state = torch.load(ckpt_path, map_location=device, weights_only=False)
-    if any(k.startswith("module.") for k in state):
-        state = {k[len("module."):]: v for k, v in state.items()}
-    model.load_state_dict(state)
     model.eval()
     for p in model.parameters():
         p.requires_grad = False
 
     tokenizer = open_clip.get_tokenizer(model_name)
-    print(f"[encoder] {model_name} loaded from {ckpt_path}")
     return model, tokenizer
 
 
@@ -207,6 +219,12 @@ def main():
                     help="limit images per split (smoke testing)")
     ap.add_argument("--splits", nargs="+", default=["train", "val"],
                     choices=["train", "val"])
+    ap.add_argument("--encoder-mode", default="run1", choices=["run1", "standard_clip"],
+                    help="run1: ModalityGap-trained encoder (gap-closed). "
+                         "standard_clip: OpenAI vanilla CLIP (Stage 2 baseline, large gap).")
+    ap.add_argument("--cache-dir", default=None,
+                    help="override cfg['cache_dir']. Stage 2 시 별도 디렉토리 권장 "
+                         "(예: --cache-dir Code/SemComm/cache_std_clip)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -214,8 +232,10 @@ def main():
     device = torch.device(f"cuda:{enc_cfg['device_id']}" if torch.cuda.is_available() else "cpu")
 
     coco_root = resolve_path(cfg["coco_root"], HERE)
-    cache_dir = resolve_path(cfg["cache_dir"], HERE)
+    cache_dir_str = args.cache_dir if args.cache_dir else cfg["cache_dir"]
+    cache_dir = resolve_path(cache_dir_str, HERE)
     cache_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[cache_dir] {cache_dir}  (encoder_mode={args.encoder_mode})")
 
     split_paths = {
         "train": (
@@ -228,7 +248,7 @@ def main():
         ),
     }
 
-    model, tokenizer = load_encoder(cfg, device)
+    model, tokenizer = load_encoder(cfg, device, mode=args.encoder_mode)
 
     # Merge with existing index.json so re-running one split doesn't wipe the other.
     index_path = cache_dir / "index.json"

@@ -59,7 +59,7 @@ def resolve(p: str, base: Path) -> Path:
 def save_grid_with_captions(x_gt: torch.Tensor, x_hat: torch.Tensor,
                             gt_captions: list[str], decoded_captions: list[str],
                             zsrc: str, out_path: Path,
-                            wrap_width: int = 28, max_cols: int = 6) -> None:
+                            wrap_width: int = 34, max_cols: int = 7) -> None:
     """matplotlib으로 GT row + recon row + caption text를 합쳐 한 PNG로 저장.
 
     zsrc == "ztxt": GT caption(z_txt의 source)과 decoded caption(captions_ztxt[j]) 둘 다 표시.
@@ -68,11 +68,24 @@ def save_grid_with_captions(x_gt: torch.Tensor, x_hat: torch.Tensor,
 
     n > max_cols인 경우 (GT, Recon) 2-row 그룹을 여러 번 쌓아 아래로 wrap.
     """
+    import numpy as np
     n = x_gt.size(0)
     n_groups = (n + max_cols - 1) // max_cols
     cols = min(n, max_cols)
-    rows = 2 * n_groups
-    fig, axes = plt.subplots(rows, cols, figsize=(cols * 2.4, n_groups * 6.0), squeeze=False)
+    # Nested gridspec.
+    # 핵심: set_box_aspect(1)로 axes를 강제 정사각형 → imshow 자동 padding 제거 →
+    #       hspace/wspace 값이 실제 visible spacing에 직결됨.
+    # figsize: 각 axes ≈ 2.4" 정사각 + caption 영역. group 높이 ≈ 2*2.4 + 0.7 ≈ 5.5".
+    fig = plt.figure(figsize=(cols * 2.4, n_groups * 5.5))
+    outer_gs = fig.add_gridspec(n_groups, 1, hspace=0.23)
+    axes = np.empty((2 * n_groups, cols), dtype=object)
+    for g in range(n_groups):
+        inner_gs = outer_gs[g].subgridspec(2, cols, hspace=0.02, wspace=0.02)
+        for r in range(2):
+            for c in range(cols):
+                ax = fig.add_subplot(inner_gs[r, c])
+                ax.set_box_aspect(1)
+                axes[2 * g + r, c] = ax
     for k in range(n):
         group = k // max_cols
         col = k % max_cols
@@ -87,13 +100,13 @@ def save_grid_with_captions(x_gt: torch.Tensor, x_hat: torch.Tensor,
         lines = []
         if zsrc == "ztxt" and gt_captions is not None:
             wrapped_gt = "\n".join(textwrap.wrap(gt_captions[k], width=wrap_width)) or "(empty)"
-            lines.append(f"GT cap:\n{wrapped_gt}")
+            lines.append(f"GT caption:\n{wrapped_gt}")
         if decoded_captions is not None:
             wrapped_dec = "\n".join(textwrap.wrap(decoded_captions[k], width=wrap_width)) or "(empty)"
-            lines.append(f"Decoded:\n{wrapped_dec}")
+            lines.append(f"Decoded caption:\n{wrapped_dec}")
         caption_text = "\n\n".join(lines) if lines else ""
         if caption_text:
-            axes[recon_row, col].set_xlabel(caption_text, fontsize=6.5)
+            axes[recon_row, col].set_xlabel(caption_text, fontsize=7.5)
     # 마지막 group에서 남는 빈 칸 숨기기
     last_group_filled = n - (n_groups - 1) * max_cols
     if last_group_filled < cols:
@@ -103,7 +116,70 @@ def save_grid_with_captions(x_gt: torch.Tensor, x_hat: torch.Tensor,
     for g in range(n_groups):
         axes[2 * g, 0].set_ylabel("GT", fontsize=10)
         axes[2 * g + 1, 0].set_ylabel("Recon", fontsize=10)
-    fig.tight_layout()
+    fig.savefig(out_path, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_grid_paired_comparison(
+    x_gt: torch.Tensor,
+    x_hat_zimg: torch.Tensor, x_hat_ztxt: torch.Tensor,
+    gt_captions: list[str] | None,
+    decoded_zimg: list[str] | None, decoded_ztxt: list[str] | None,
+    out_path: Path, wrap_width: int = 36, max_cols: int = 6,
+) -> None:
+    """한 column = GT / zimg recon / ztxt recon (3 row). caption text 는 column 하단에
+    GT caption + Decoded(zimg) + Decoded(ztxt) 셋을 함께 표시. zimg vs ztxt 의 cross-modal
+    swap 효과를 한 PNG에서 직접 비교할 수 있게 만든 layout."""
+    import numpy as np
+    n = x_gt.size(0)
+    n_groups = (n + max_cols - 1) // max_cols
+    cols = min(n, max_cols)
+    # 3 row × cols. group 높이 = 3*2.4 + caption 영역 ≈ 8.0".
+    fig = plt.figure(figsize=(cols * 2.4, n_groups * 8.0))
+    outer_gs = fig.add_gridspec(n_groups, 1, hspace=0.30)
+    axes = np.empty((3 * n_groups, cols), dtype=object)
+    for g in range(n_groups):
+        inner_gs = outer_gs[g].subgridspec(3, cols, hspace=0.02, wspace=0.02)
+        for r in range(3):
+            for c in range(cols):
+                ax = fig.add_subplot(inner_gs[r, c])
+                ax.set_box_aspect(1)
+                axes[3 * g + r, c] = ax
+    for k in range(n):
+        group = k // max_cols
+        col = k % max_cols
+        row_base = 3 * group
+        imgs = [
+            denorm(x_gt[k]).float().cpu().permute(1, 2, 0).numpy(),
+            denorm(x_hat_zimg[k]).float().cpu().permute(1, 2, 0).numpy(),
+            denorm(x_hat_ztxt[k]).float().cpu().permute(1, 2, 0).numpy(),
+        ]
+        for r_off, im in enumerate(imgs):
+            axes[row_base + r_off, col].imshow(im)
+            axes[row_base + r_off, col].set_xticks([])
+            axes[row_base + r_off, col].set_yticks([])
+        lines = []
+        if gt_captions is not None:
+            wrapped = "\n".join(textwrap.wrap(gt_captions[k], width=wrap_width)) or "(empty)"
+            lines.append(f"GT caption:\n{wrapped}")
+        if decoded_zimg is not None:
+            wrapped = "\n".join(textwrap.wrap(decoded_zimg[k], width=wrap_width)) or "(empty)"
+            lines.append(f"Decoded (zimg):\n{wrapped}")
+        if decoded_ztxt is not None:
+            wrapped = "\n".join(textwrap.wrap(decoded_ztxt[k], width=wrap_width)) or "(empty)"
+            lines.append(f"Decoded (ztxt):\n{wrapped}")
+        caption_text = "\n\n".join(lines) if lines else ""
+        if caption_text:
+            axes[row_base + 2, col].set_xlabel(caption_text, fontsize=7.0)
+    last_group_filled = n - (n_groups - 1) * max_cols
+    if last_group_filled < cols:
+        for col in range(last_group_filled, cols):
+            for r_off in range(3):
+                axes[3 * (n_groups - 1) + r_off, col].axis("off")
+    for g in range(n_groups):
+        axes[3 * g, 0].set_ylabel("GT", fontsize=10)
+        axes[3 * g + 1, 0].set_ylabel("Recon\n(zimg)", fontsize=10)
+        axes[3 * g + 2, 0].set_ylabel("Recon\n(ztxt)", fontsize=10)
     fig.savefig(out_path, dpi=110, bbox_inches="tight")
     plt.close(fig)
 
@@ -129,15 +205,23 @@ def main():
     ap.add_argument("--use-gt-caption", action="store_true",
                     help="cached ĉ 대신 GT caption 사용 (학습 시 curriculum과 동일 behavior)")
     ap.add_argument("--all-combos", action="store_true",
-                    help="z_source × cfg_scale 조합을 한 번에 생성. default 6 PNG "
-                         "(zimg/ztxt × 1.0/3.0/7.5). --include-random 시 9 PNG. "
-                         "samples/epoch_<ckpt>/recon_{zsrc}_cfg{scale}.png로 저장.")
+                    help="Paired comparison 모드 — cfg 1.5/3.0/7.0 각각에 대해 한 PNG 생성 (총 3개). "
+                         "각 column 은 GT / zimg recon / ztxt recon 3 row 로 구성되어 "
+                         "cross-modal swap 효과를 직접 비교 가능. "
+                         "samples/<ckpt>/paired_cfg{scale}.png 로 저장.")
     ap.add_argument("--include-random", action="store_true",
-                    help="--all-combos에 random z_source 포함 (학습 default 동작 reproduction). "
-                         "보통 평가/ablation에는 zimg vs ztxt 페어만으로 충분.")
+                    help="(legacy, paired 모드에서는 무시됨) 이전 z_source 분리 모드에서 random 포함용.")
     ap.add_argument("--seed", type=int, default=None,
                     help="val sample selection seed. 미지정 시 sequential (첫 n images). "
                          "지정 시 그 seed로 val image indices를 shuffle해 random pick.")
+    ap.add_argument("--noise-seed", type=int, default=None,
+                    help="diffusion inference 시 초기 latent noise + random z mask seed. "
+                         "미지정 시 매 호출마다 다른 결과. 지정 시 같은 noise-seed 면 항상 "
+                         "동일 recon (--all-combos 의 각 combo는 동일 seed 로 reset).")
+    ap.add_argument("--coco-image-ids", type=int, nargs="+", default=None,
+                    help="COCO image_id 를 직접 지정 (e.g. --coco-image-ids 397133 458755 ...). "
+                         "지정 시 --seed/--n 무시. cache/index.json 의 val.image_ids 안에 "
+                         "존재해야 함. 특정 이미지로 정성평가 / 재현 시 사용.")
     args = ap.parse_args()
 
     run_dir = resolve(args.run_dir, HERE)
@@ -204,7 +288,20 @@ def main():
             first_cap_for_image[im_idx] = cap_idx
 
     available_image_indices = sorted(first_cap_for_image.keys())
-    if args.seed is not None:
+    if args.coco_image_ids is not None:
+        # User 가 직접 COCO image_id 지정 → val_image_ids 에서 internal idx 로 역매핑.
+        coco_id_to_idx = {iid: i for i, iid in enumerate(val_image_ids)}
+        missing = [iid for iid in args.coco_image_ids if iid not in coco_id_to_idx]
+        if missing:
+            raise ValueError(f"COCO image_id 가 val cache 에 없음: {missing}")
+        selected_image_indices = [coco_id_to_idx[iid] for iid in args.coco_image_ids]
+        # caption_image_idx 에 등장하지 않는 image (caption 없는 이미지) 는 추론 불가.
+        no_cap = [iid for iid, i in zip(args.coco_image_ids, selected_image_indices)
+                  if i not in first_cap_for_image]
+        if no_cap:
+            raise ValueError(f"caption 없는 COCO image_id (caption_image_idx 미등록): {no_cap}")
+        print(f"[select] manual (--coco-image-ids) → image indices: {selected_image_indices}")
+    elif args.seed is not None:
         g = torch.Generator().manual_seed(args.seed)
         perm = torch.randperm(len(available_image_indices), generator=g).tolist()
         selected_image_indices = [available_image_indices[p] for p in perm[:args.n]]
@@ -212,6 +309,9 @@ def main():
     else:
         selected_image_indices = available_image_indices[:args.n]
         print(f"[select] sequential → image indices: {selected_image_indices}")
+    # COCO image_id (실제 파일명 번호) 도 같이 출력 — image_idx 는 내부 인덱스라 파일 찾기 불편.
+    selected_coco_ids = [val_image_ids[i] for i in selected_image_indices]
+    print(f"[select] → COCO image_ids: {selected_coco_ids}")
 
     xs, z_imgs, z_txts, gts, zimg_caps, ztxt_caps = [], [], [], [], [], []
     for i in selected_image_indices:
@@ -259,24 +359,28 @@ def main():
         return z_in, caps
 
     def run_inference(z_in: torch.Tensor, captions_in, cfg_scale: float):
+        """CFG batching 적용: cond + uncond 를 한 batch 로 합쳐 UNet 1번 호출 (호출 수 절반).
+        BS 는 2배로 늘지만 GB10 128GB 유니파이드 메모리에서 충분히 처리 가능."""
         x_hats = []
         bs = args.batch_size
+        use_cfg = cfg_scale != 1.0
         for s in range(0, n_actual, bs):
             zb = z_in[s:s + bs]
             cb = captions_in[s:s + bs] if captions_in is not None else None
             with torch.no_grad():
                 cond = model.build_condition(zb, cb)
-                if cfg_scale != 1.0:
-                    uncond = torch.zeros_like(cond)
+                ctx = torch.cat([torch.zeros_like(cond), cond], dim=0) if use_cfg else cond
                 latent = torch.randn(zb.size(0), 4, 28, 28, device=device, dtype=dtype)
                 for t in ddim.timesteps:
                     ts = torch.tensor([t.item()] * zb.size(0), device=device).long()
-                    eps_c = model.unet(latent, ts, encoder_hidden_states=cond).sample
-                    if cfg_scale != 1.0:
-                        eps_u = model.unet(latent, ts, encoder_hidden_states=uncond).sample
+                    if use_cfg:
+                        latent_2x = torch.cat([latent, latent], dim=0)
+                        ts_2x = torch.cat([ts, ts], dim=0)
+                        eps_2x = model.unet(latent_2x, ts_2x, encoder_hidden_states=ctx).sample
+                        eps_u, eps_c = eps_2x.chunk(2, dim=0)
                         eps = eps_u + cfg_scale * (eps_c - eps_u)
                     else:
-                        eps = eps_c
+                        eps = model.unet(latent, ts, encoder_hidden_states=ctx).sample
                     latent = ddim.step(eps, t, latent).prev_sample
                 x_hat = model.decode_latent_to_image(latent)
             x_hats.append(x_hat)
@@ -285,34 +389,46 @@ def main():
     cap_tag = "capON" if caption_stream_on else "capOFF"
     ckpt_tag = args.ckpt.replace(".pt", "")
 
+    def seed_noise_rng():
+        """noise-seed 가 지정된 경우 torch global RNG 를 그 seed 로 reset.
+        run_inference 의 torch.randn(latent) + build_z_and_caps 의 torch.rand(z mask) 둘 다 영향."""
+        if args.noise_seed is not None:
+            torch.manual_seed(args.noise_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(args.noise_seed)
+
     if args.all_combos:
-        # Default 6 PNG: zimg/ztxt × cfg 1.0/3.0/7.5. random은 inference 시점에 평가 가치
-        # 적어 default에서 제외 (학습 default 동작 reproduction이 필요하면 --include-random).
-        # --seed 지정 시 파일명에 _seed{N} suffix를 붙여 sequential 결과를 덮어쓰지 않음.
+        # Paired comparison mode: 한 column = GT / zimg recon / ztxt recon. cfg 별 1 PNG.
+        # 같은 cfg 안에서 zimg ↔ ztxt 가 동일 noise-seed 로 비교되어 cross-modal swap 효과를
+        # 직접 비교 가능. 총 3 PNG (cfg 1.0/3.0/7.5). --include-random 은 이 모드에서 무시.
         seed_suffix = f"_seed{args.seed}" if args.seed is not None else ""
-        z_sources_to_run = ["zimg", "ztxt"]
-        if args.include_random:
-            z_sources_to_run = ["random"] + z_sources_to_run
-        n_combos = len(z_sources_to_run) * 3
+        if args.noise_seed is not None:
+            seed_suffix += f"_nseed{args.noise_seed}"
         out_dir = run_dir / "samples" / ckpt_tag
         out_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[sample] all_combos mode — {n_combos} PNGs → {out_dir}")
-        for zsrc in z_sources_to_run:
-            for cfg_scale in (10, 3.0, 7.5):
-                z_in, captions_in = build_z_and_caps(zsrc)
-                x_hat = run_inference(z_in, captions_in, cfg_scale)
-                # ztxt: z의 source인 GT caption(=gts) + decoded caption(=captions_in) 둘 다 표시
-                # zimg/random: z의 source가 caption이 아니므로 decoded만 표시
-                gt_caps_for_panel = gts if zsrc == "ztxt" else None
-                out_path = out_dir / f"recon_{zsrc}_cfg{cfg_scale}{seed_suffix}.png"
-                save_grid_with_captions(
-                    x_gt, x_hat, gt_caps_for_panel, captions_in, zsrc, out_path,
-                )
-                print(f"  [save] {out_path.name}")
-        print(f"[done] {n_combos} grids saved under {out_dir}")
+        cfg_scales = (3.0, 5.0, 7.0)
+        print(f"[sample] paired mode — {len(cfg_scales)} PNGs (cfg {cfg_scales}) → {out_dir}")
+        z_imgs_in, caps_zimg = build_z_and_caps("zimg")
+        z_txts_in, caps_ztxt = build_z_and_caps("ztxt")
+        for cfg_scale in cfg_scales:
+            seed_noise_rng()
+            x_hat_zimg = run_inference(z_imgs_in, caps_zimg, cfg_scale)
+            seed_noise_rng()  # ztxt도 동일 noise 로 reset → 공정 비교
+            x_hat_ztxt = run_inference(z_txts_in, caps_ztxt, cfg_scale)
+            out_path = out_dir / f"paired{seed_suffix}_cfg{cfg_scale}.png"
+            save_grid_paired_comparison(
+                x_gt, x_hat_zimg, x_hat_ztxt,
+                gts,  # z_txt 의 source GT caption (항상 표시)
+                caps_zimg if caption_stream_on else None,
+                caps_ztxt if caption_stream_on else None,
+                out_path,
+            )
+            print(f"  [save] {out_path.name}")
+        print(f"[done] {len(cfg_scales)} paired grids saved under {out_dir}")
         return
 
     # Single inference (기존 동작)
+    seed_noise_rng()
     z_in, captions_in = build_z_and_caps(args.z_source)
     print(f"[sample] N={n_actual}, z_source={args.z_source}, caption_stream={caption_stream_on}, "
           f"steps={args.steps}, cfg_scale={args.cfg_scale}")

@@ -69,6 +69,8 @@ def main():
                     help="COCO caption 95th-percentile ~25 token, 20 covers most")
     ap.add_argument("--overwrite", action="store_true",
                     help="regenerate even if cache file already exists")
+    ap.add_argument("--cache-dir", default=None,
+                    help="override cfg['cache_dir']. Stage 2 (Standard CLIP) 시 사용.")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -76,7 +78,8 @@ def main():
         f"cuda:{cfg['text_decoder']['device_id']}" if torch.cuda.is_available() else "cpu"
     )
 
-    cache_dir = resolve_path(cfg["cache_dir"], HERE)
+    cache_dir = resolve_path(args.cache_dir if args.cache_dir else cfg["cache_dir"], HERE)
+    print(f"[cache_dir] {cache_dir}")
     runs_root = resolve_path(cfg["runs_root"], HERE)
     run_dir = runs_root / args.text_decoder_run
     ckpt_path = run_dir / "checkpoints" / "final.pt"

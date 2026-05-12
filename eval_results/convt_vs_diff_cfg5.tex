@@ -1,0 +1,29 @@
+\begin{table}[t]
+  \centering
+  \caption{Per z_source metrics}
+  \begin{tabular}{lcccccc}
+  \toprule
+  model & z\_src & fid $\downarrow$ & lpips $\downarrow$ & clip\_score $\uparrow$ & psnr $\uparrow$ & ssim $\uparrow$ \\
+  \midrule
+  ConvT (img\_centroid\_bs256\_ep30\_20260506-130321) & zimg & 400.009 & 0.750 & 0.188 & 12.233 & 0.153 \\
+  ConvT (img\_centroid\_bs256\_ep30\_20260506-130321) & ztxt & 401.247 & 0.756 & 0.189 & 11.838 & 0.150 \\
+  Diffusion cfg5.0 (imgdiff\_random\_img\_txt\_capON\_bs16\_lr0.0001\_r8\_20260511-153122) & zimg & 58.773 & 0.695 & 0.269 & 9.331 & 0.205 \\
+  Diffusion cfg5.0 (imgdiff\_random\_img\_txt\_capON\_bs16\_lr0.0001\_r8\_20260511-153122) & ztxt & 60.977 & 0.725 & 0.291 & 8.937 & 0.189 \\
+  \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{table}[t]
+  \centering
+  \caption{$\Delta$ (ztxt − zimg) — modality-agnostic}
+  \begin{tabular}{lccccc}
+  \toprule
+  model & $\Delta$fid & $\Delta$lpips & $\Delta$clip\_score & $\Delta$psnr & $\Delta$ssim \\
+  \midrule
+  ConvT (img\_centroid\_bs256\_ep30\_20260506-130321) & +1.238 & +0.006 & +0.001 & -0.395 & -0.004 \\
+  Diffusion cfg5.0 (imgdiff\_random\_img\_txt\_capON\_bs16\_lr0.0001\_r8\_20260511-153122) & +2.204 & +0.030 & +0.022 & -0.394 & -0.016 \\
+  \bottomrule
+  \end{tabular}
+\end{table}
+
+% fid/lpips ↓ better, clip_score/psnr/ssim ↑ better. |Δ| ↓ better (modality-agnostic).

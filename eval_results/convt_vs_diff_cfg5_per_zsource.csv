@@ -1,0 +1,5 @@
+model,decoder_type,cfg_scale,noise_seed,ckpt,n,seed,z_src,fid,lpips,clip_score,psnr,ssim
+ConvT,convt,,,runs/img_centroid_bs256_ep30_20260506-130321/checkpoints/epoch_005.pt,1000,42,zimg,400.009120,0.750336,0.188012,12.233110,0.153417
+ConvT,convt,,,runs/img_centroid_bs256_ep30_20260506-130321/checkpoints/epoch_005.pt,1000,42,ztxt,401.246841,0.756232,0.189025,11.837831,0.149893
+Diffusion(cfg=5.0),diffusion,5.0,7,runs/imgdiff_random_img_txt_capON_bs16_lr0.0001_r8_20260511-153122/checkpoints/final.pt,1000,42,zimg,58.772820,0.694966,0.268642,9.331335,0.204978
+Diffusion(cfg=5.0),diffusion,5.0,7,runs/imgdiff_random_img_txt_capON_bs16_lr0.0001_r8_20260511-153122/checkpoints/final.pt,1000,42,ztxt,60.976627,0.724591,0.290571,8.937323,0.189017

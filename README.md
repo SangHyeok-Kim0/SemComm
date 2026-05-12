@@ -48,12 +48,21 @@ python Code/SemComm/encode_dataset.py
 
 # 샘플 (smoke test)
 python Code/SemComm/encode_dataset.py --max-images 256 --splits train val
+
+# Stage 2 — Standard CLIP (OpenAI pretrained, gap≈0.5) 별도 cache
+python Code/SemComm/encode_dataset.py \
+    --encoder-mode standard_clip \
+    --cache-dir Code/SemComm/cache_std_clip
 ```
 
 산출:
 - `cache/z_img_{train,val}.pt`  — (N_img, 1024) fp16, unit-norm
 - `cache/z_txt_{train,val}.pt`  — (N_cap, 1024) fp16, unit-norm
 - `cache/index.json`            — image_ids, caption_image_idx, caption_texts
+
+CLI flags:
+- `--encoder-mode {run1, standard_clip}` (default: `run1`). `standard_clip` 은 OpenAI pretrained RN50 (no ModalityGap training).
+- `--cache-dir <path>` cfg['cache_dir'] override. Stage 2 시 별도 디렉토리 (`cache_std_clip/`) 권장.
 
 ### Step 2 — Text Decoder (Qwen3-0.6B-Base + Transformer mapper)
 
@@ -68,7 +77,17 @@ python Code/SemComm/train_text_decoder.py \
 # Resume
 python Code/SemComm/train_text_decoder.py \
   --resume runs/txt_random_img_txt_..._<ts> --epochs 5
+
+# Stage 2 — Standard CLIP cache 로 학습 (run_name 에 std_clip suffix 박힘)
+python Code/SemComm/train_text_decoder.py \
+    --cache-dir Code/SemComm/cache_std_clip \
+    --z-source random_img_txt \
+    --run-name-suffix std_clip
 ```
+
+CLI flags 추가:
+- `--cache-dir` cfg['cache_dir'] override. Stage 2 시 필수.
+- `--run-name-suffix <str>` run dir 명에 suffix 박아 encoder 종류 추적 (예: `txt_random_img_txt_..._std_clip_<ts>`).
 
 z_source 옵션:
 - `centroid`: z = normalize((z_img[i] + z_txt[j]) / 2)
@@ -84,6 +103,11 @@ frozen text decoder의 `generate()`를 사전 호출해 image decoder의 caption
 ```bash
 python Code/SemComm/encode_captions.py \
     --text-decoder-run txt_random_img_txt_..._<ts>
+
+# Stage 2 — Standard CLIP text decoder 의 caption cache 생성
+python Code/SemComm/encode_captions.py \
+    --cache-dir Code/SemComm/cache_std_clip \
+    --text-decoder-run txt_random_img_txt_..._std_clip_<ts>
 ```
 
 산출 (~40MB 합계, ~25분 on GB10):
@@ -124,7 +148,18 @@ python Code/SemComm/train_image_decoder_v2.py \
 # Sanity
 python Code/SemComm/train_image_decoder_v2.py \
     --max-train-images 20 --epochs 1 --batch-size 4 --text-decoder-run ""
+
+# Stage 2 — Standard CLIP cache + Standard CLIP text decoder 로 학습
+python Code/SemComm/train_image_decoder_v2.py \
+    --cache-dir Code/SemComm/cache_std_clip \
+    --text-decoder-run txt_random_img_txt_..._std_clip_<ts> \
+    --z-source random_img_txt \
+    --run-name-suffix std_clip
 ```
+
+Stage 2 CLI flags 추가:
+- `--cache-dir` cfg['cache_dir'] override.
+- `--run-name-suffix <str>` run dir 에 박아 encoder 출처 추적 (예: `imgdiff_random_img_txt_capON_..._std_clip_<ts>`).
 
 z_source 옵션:
 - `centroid`: normalize((z_img + z_txt) / 2)
@@ -149,15 +184,23 @@ Loss: ε-prediction MSE in VAE latent (28×28×4). pixel-level metric은 미사�
 매 epoch 저장된 `epoch_NNN.pt` ckpt로 즉시 sample image 생성. 학습 process와 GPU 공유 가능 (~5GB 추가). 학습 끝 기다리지 않고 진행 상황을 시각적으로 추적하거나, z_source/CFG ablation을 빠르게 시도하는 도구. 모든 명령은 **workspace 디렉터리**(`/workspace`)에서 실행.
 
 ```bash
-# 추천: 6 combos 한 번에 (zimg/ztxt × cfg 1.0/3.0/7.5 = 6 PNG) — train 매 epoch 자동 출력과 동일 구조
+# 추천: paired comparison 모드 — cfg 별 한 PNG (총 3 PNG). 각 column 은
+# GT / zimg recon / ztxt recon 3 row 구성 → cross-modal swap 효과를 한 PNG에서 직접 비교.
 python Code/SemComm/infer_image_decoder_v2.py \
     --run-dir runs/imgdiff_random_img_txt_capON_bs16_lr0.0001_r8_20260511-153122 \
     --ckpt epoch_004.pt --all-combos --n 8 --seed 26
-# 산출: samples/epoch_003/recon_{zimg,ztxt}_cfg{1.0,3.0,7.5}_seed42.png (6개)
+# 산출: samples/epoch_004/paired_cfg{1.5,3.0,7.0}_seed26.png (3개)
+```
 
-# random z_source 포함 시 9 PNG (학습 default 동작 reproduction용)
-python Code/SemComm/infer_image_decoder_v2.py \
-    --run-dir runs/... --ckpt epoch_003.pt --all-combos --include-random --n 8
+```bash
+python Code/SemComm/infer_image_decoder_v2.py     --run-dir runs/imgdiff_random_img_txt_capON_bs16_lr0.0001_r8_20260511-153122     --ckpt epoch_006.pt --all-combos --n 12 --noise-seed 7 --coco-image-ids 119233 57238 57027 570688 420281 274066 336265 13546 320642 100283 472030 61333
+python Code/SemComm/infer_image_decoder_v2.py     --run-dir runs/imgdiff_random_img_txt_capON_bs16_lr0.0001_r8_20260511-153122     --ckpt epoch_008.pt --all-combos --n 12 --noise-seed 7 --coco-image-ids 119233 57238 57027 570688 420281 274066 336265 13546 320642 100283 472030 61333
+python Code/SemComm/infer_image_decoder_v2.py     --run-dir runs/imgdiff_random_img_txt_capON_bs16_lr0.0001_r8_20260511-153122     --ckpt epoch_010.pt --all-combos --n 12 --noise-seed 7 --coco-image-ids 119233 57238 57027 570688 420281 274066 336265 13546 320642 100283 472030 61333
+python Code/SemComm/infer_image_decoder_v2.py     --run-dir runs/imgdiff_random_img_txt_capON_bs16_lr0.0001_r8_20260511-153122     --ckpt epoch_012.pt --all-combos --n 12 --noise-seed 7 --coco-image-ids 119233 57238 57027 570688 420281 274066 336265 13546 320642 100283 472030 61333
+python Code/SemComm/infer_image_decoder_v2.py     --run-dir runs/imgdiff_random_img_txt_capON_bs16_lr0.0001_r8_20260511-153122     --ckpt epoch_014.pt --all-combos --n 12 --noise-seed 7 --coco-image-ids 119233 57238 57027 570688 420281 274066 336265 13546 320642 100283 472030 61333
+python Code/SemComm/infer_image_decoder_v2.py     --run-dir runs/imgdiff_random_img_txt_capON_bs16_lr0.0001_r8_20260511-153122     --ckpt epoch_016.pt --all-combos --n 12 --noise-seed 7 --coco-image-ids 119233 57238 57027 570688 420281 274066 336265 13546 320642 100283 472030 61333
+python Code/SemComm/infer_image_decoder_v2.py     --run-dir runs/imgdiff_random_img_txt_capON_bs16_lr0.0001_r8_20260511-153122     --ckpt epoch_018.pt --all-combos --n 12 --noise-seed 7 --coco-image-ids 119233 57238 57027 570688 420281 274066 336265 13546 320642 100283 472030 61333
+python Code/SemComm/infer_image_decoder_v2.py     --run-dir runs/imgdiff_random_img_txt_capON_bs16_lr0.0001_r8_20260511-153122     --ckpt epoch_020.pt --all-combos --n 12 --noise-seed 7 --coco-image-ids 119233 57238 57027 570688 420281 274066 336265 13546 320642 100283 472030 61333
 ```
 
 옵션별 사용 예시 (모두 workspace에서 실행):
@@ -172,6 +215,16 @@ python Code/SemComm/infer_image_decoder_v2.py \
 python Code/SemComm/infer_image_decoder_v2.py \
     --run-dir runs/imgdiff_..._<ts> --ckpt epoch_005.pt \
     --all-combos --n 8 --seed 42
+
+# Inference noise 까지 고정 (--seed 와 --noise-seed 둘 다 지정 → 완전히 deterministic)
+python Code/SemComm/infer_image_decoder_v2.py \
+    --run-dir runs/imgdiff_..._<ts> --ckpt epoch_005.pt \
+    --all-combos --n 8 --seed 42 --noise-seed 7
+
+# 특정 COCO image_id 지정 (정성평가용. --seed/--n 무시됨)
+python Code/SemComm/infer_image_decoder_v2.py \
+    --run-dir runs/imgdiff_..._<ts> --ckpt epoch_005.pt \
+    --all-combos --noise-seed 7 --coco-image-ids 397133 458755 173350 522418
 
 # Caption stream 끄기 (M3 ablation)
 python Code/SemComm/infer_image_decoder_v2.py \
@@ -191,9 +244,11 @@ CLI 옵션 요약:
 | `--z-source` | `random` (50/50) / `zimg` / `ztxt` / `centroid` | `random` |
 | `--steps` | DDIM step 수 | 30 |
 | `--cfg-scale` | classifier-free guidance scale | 1.0 |
-| `--all-combos` | 6 PNG (zimg/ztxt × cfg) 한 번에. `--include-random`이면 9 PNG | — |
-| `--include-random` | `--all-combos`에 random z_source 추가 (학습 default 동작 reproduction) | — |
+| `--all-combos` | Paired comparison 모드 — cfg 별 1 PNG (총 3개). 각 column = GT / zimg recon / ztxt recon | — |
+| `--include-random` | (legacy, paired 모드에서는 무시됨) | — |
 | `--seed` | val image random 선택 시드 (미지정 시 sequential 첫 n개) | None (sequential) |
+| `--noise-seed` | diffusion inference 시 초기 latent noise + random z mask 시드 (미지정 시 매 호출마다 다른 recon) | None |
+| `--coco-image-ids` | COCO image_id 를 직접 지정 (e.g. `397133 458755`). 지정 시 `--seed`/`--n` 무시 | None |
 | `--no-caption` | caption stream 강제 OFF | — |
 | `--use-gt-caption` | cached ĉ 대신 GT caption 사용 | — |
 | `--output` | output PNG 경로 override (single inference만) | auto |
@@ -202,6 +257,12 @@ Sample selection 동작:
 - **`--seed` 미지정**: sorted val image indices의 첫 n개 (예: index 0, 1, 2, ..., n-1). 매번 같은 GT 8장.
 - **`--seed N` 지정**: `torch.randperm(N_val_images, seed=N)`으로 shuffle 후 첫 n개. 같은 seed면 재현 가능, 다른 seed면 다른 sample.
 - 각 image의 첫 caption(`caption_image_idx[j]==i` 만족하는 첫 j)을 convention으로 사용. z_txt 인덱스 j와 captions_ztxt[j], z_img 인덱스 i와 captions_zimg[i]가 정확히 매칭.
+
+Inference noise 재현성 (`--seed` vs `--noise-seed`):
+- **`--seed`**: GT 이미지 선택만 결정. 같은 seed → 같은 GT 8장. **Recon 결과는 매번 다름** (latent noise가 매번 새로 sampling됨).
+- **`--noise-seed`**: 디퓨전 초기 latent noise + `--z-source random` 의 zimg/ztxt 마스크를 reset. 같은 noise-seed → 같은 recon.
+- **`--all-combos`** 에서는 각 combo (zsrc × cfg) 시작 직전에 noise-seed가 reset됨 → 모든 6 combo가 **동일한 초기 noise** 위에서 비교되어 공정한 ablation 가능.
+- 파일명 suffix: `--seed 42 --noise-seed 7` → `recon_zimg_cfg3.0_seed42_nseed7.png` (덮어쓰기 방지).
 
 파일명에 `z_source / cap on-off / cfg_scale`가 모두 박혀 있어 여러 조합 돌려도 덮어쓰기 없음. ckpt도 다르면 `samples/epoch_001/`, `samples/epoch_005/` 분리 저장 → epoch별 quality 변화 시각 추적 가능.
 
@@ -223,7 +284,30 @@ python Code/SemComm/eval_captions.py --run-dir runs/txt_..._<ts>
 
 자세한 옵션은 `visualize_captions.py --help` / `eval_captions.py --help`.
 
-이미지 디코더 평가는 v2 학습 run의 `samples/epoch_*.png` (매 epoch GT+복원 grid) 와 wandb의 `samples/val_grid`로 시각 검증. 정량 평가 script는 향후 추가 (FID/CLIP-score/LPIPS, 5k val 기준).
+이미지 디코더 평가는 v2 학습 run의 `samples/epoch_*.png` (매 epoch GT+복원 grid) 와 wandb의 `samples/val_grid`로 시각 검증.
+
+**정량 평가 (`eval_image.py`)** — ConvT/Diffusion 자동 감지, 5 metric (FID / LPIPS-vgg / CLIP-score / PSNR / SSIM) + Δ(ztxt − zimg):
+```bash
+# ConvT baseline
+python Code/SemComm/eval_image.py --run-dir runs/img_convt_..._<ts> --n 1000
+
+# Diffusion proposed (같은 --seed/--noise-seed 로 공정 비교)
+python Code/SemComm/eval_image.py --run-dir runs/imgdiff_..._<ts> \
+    --ckpt epoch_010.pt --n 1000 --cfg-scale 3.0 --noise-seed 7
+
+# 두 결과 한 표로 비교
+python Code/SemComm/compare_image_decoders.py \
+    Code/SemComm/runs/img_centroid_bs256_ep30_20260506-130321/eval/metrics_n1000_seed42.json \
+    Code/SemComm/runs/imgdiff_random_img_txt_capON_bs16_lr0.0001_r8_20260511-153122/eval/metrics_n1000_seed42_cfg5.0_nseed7.json
+
+# CSV/Markdown/LaTeX 까지 저장
+python Code/SemComm/compare_image_decoders.py \
+    Code/SemComm/runs/img_centroid_bs256_ep30_20260506-130321/eval/metrics_n1000_seed42.json \
+    Code/SemComm/runs/imgdiff_random_img_txt_capON_bs16_lr0.0001_r8_20260511-153122/eval/metrics_n1000_seed42_cfg5.0_nseed7.json \
+    --output-dir Code/SemComm/eval_results --tag convt_vs_diff_cfg5
+```
+
+CLIP-score 는 학습 RN50 과 다른 **ViT-B/32 OAI** 로 평가 (circular evaluation 회피). 결과는 각 run 의 `eval/metrics_*.json` 에 저장.
 
 ### 산출물 (각 학습 run)
 
@@ -317,4 +401,48 @@ python train_image_decoder_v2.py --z-source modality --text-decoder-run txt_rand
 python train_image_decoder_v2.py --z-source modality --text-decoder-run ""
 ```
 
-Stage 2 (Standard CLIP baseline 비교)는 Stage 1의 image decoder가 선명한 cross-modal reconstruction을 보인 후 진행.
+## 전체 학습 파이프라인 (Stage 2, Standard CLIP baseline)
+
+Stage 1 결과 확인 후 Standard CLIP encoder 로 같은 protocol 반복 → modality gap reduction 필요성 정량 입증. 모든 명령은 workspace 디렉토리에서 실행.
+
+```bash
+# 0. Standard CLIP 임베딩 cache (별도 디렉토리)
+python Code/SemComm/encode_dataset.py \
+    --encoder-mode standard_clip \
+    --cache-dir Code/SemComm/cache_std_clip
+
+# 1. text decoder (random_img_txt, ~1.5h)
+python Code/SemComm/train_text_decoder.py \
+    --cache-dir Code/SemComm/cache_std_clip \
+    --z-source random_img_txt \
+    --run-name-suffix std_clip
+# → 새 run dir 메모: runs/txt_random_img_txt_..._std_clip_<ts>
+
+# 2. caption cache (~25분)
+python Code/SemComm/encode_captions.py \
+    --cache-dir Code/SemComm/cache_std_clip \
+    --text-decoder-run txt_random_img_txt_..._std_clip_<ts>
+
+# 3. image decoder v2 학습 (~18h)
+python Code/SemComm/train_image_decoder_v2.py \
+    --cache-dir Code/SemComm/cache_std_clip \
+    --text-decoder-run txt_random_img_txt_..._std_clip_<ts> \
+    --z-source random_img_txt \
+    --run-name-suffix std_clip
+
+# 4. 평가 (Stage 1과 동일 protocol, --seed/--noise-seed 동일하게)
+python Code/SemComm/eval_image.py \
+    --run-dir runs/imgdiff_random_img_txt_capON_..._std_clip_<ts> \
+    --ckpt final.pt --n 1000 --seed 42 --noise-seed 7 --cfg-scale 5.0
+
+# 5. Stage 1 vs Stage 2 비교 표 생성
+python Code/SemComm/compare_image_decoders.py \
+    Code/SemComm/runs/imgdiff_random_img_txt_capON_bs16_lr0.0001_r8_20260511-153122/eval/metrics_n1000_seed42_cfg5.0_nseed7.json \
+    Code/SemComm/runs/imgdiff_random_img_txt_capON_..._std_clip_<ts>/eval/metrics_n1000_seed42_cfg5.0_nseed7.json \
+    --output-dir Code/SemComm/eval_results --tag stage1_vs_stage2
+```
+
+**예상 결과** (paper 핵심 비교):
+- Standard CLIP: z_img 입력은 reasonable, **z_txt 입력 catastrophic fail** → ΔFID >> Run 1
+- Run 1 (gap-closed): z_img/z_txt 양쪽 모두 success → ΔFID ≈ 0
+- ΔMetric 단조성 plot (Standard CLIP → Run 1, x축=gap magnitude) 이 paper의 핵심 figure.

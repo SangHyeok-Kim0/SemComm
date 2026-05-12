@@ -5,3 +5,4 @@ peft>=0.10
 accelerate>=1.0
 clean-fid>=0.1.35
 lpips
+torchmetrics>=1.0

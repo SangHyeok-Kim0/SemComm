@@ -77,13 +77,14 @@ def denorm(x: torch.Tensor) -> torch.Tensor:
     return (x * 0.5 + 0.5).clamp(0.0, 1.0)
 
 
-def build_run_name(d_cfg: dict, suffix: str) -> str:
+def build_run_name(d_cfg: dict, suffix: str, name_suffix: str = "") -> str:
     if d_cfg.get("run_name") and d_cfg["run_name"] not in ("auto", "null", ""):
         return d_cfg["run_name"]
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     cap_tag = "capON" if d_cfg.get("text_decoder_run") else "capOFF"
+    extra = f"_{name_suffix}" if name_suffix else ""
     return (f"imgdiff_{d_cfg['z_source']}_{cap_tag}_bs{d_cfg['batch_size']}"
-            f"_lr{d_cfg['learning_rate']}_r{d_cfg.get('lora_rank', 8)}_{ts}")
+            f"_lr{d_cfg['learning_rate']}_r{d_cfg.get('lora_rank', 8)}{extra}_{ts}")
 
 
 # ---------------------------------------------------------------------------
@@ -308,19 +309,22 @@ def sample_images(model: DiffusionImageDecoder, scheduler, z: torch.Tensor,
     B = z.size(0)
     scheduler.set_timesteps(n_steps)
 
+    # CFG batching: cond + uncond 를 한 batch 로 합쳐 UNet 1번 호출. UNet call 수 절반.
+    use_cfg = cfg_scale != 1.0
     cond = model.build_condition(z, captions)
-    if cfg_scale != 1.0:
-        uncond = torch.zeros_like(cond)
+    ctx = torch.cat([torch.zeros_like(cond), cond], dim=0) if use_cfg else cond
 
     latent = torch.randn(B, 4, 28, 28, device=device, dtype=model.dtype)
     for t in scheduler.timesteps:
         ts = torch.tensor([t.item()] * B, device=device).long()
-        eps_c = model.unet(latent, ts, encoder_hidden_states=cond).sample
-        if cfg_scale != 1.0:
-            eps_u = model.unet(latent, ts, encoder_hidden_states=uncond).sample
+        if use_cfg:
+            latent_2x = torch.cat([latent, latent], dim=0)
+            ts_2x = torch.cat([ts, ts], dim=0)
+            eps_2x = model.unet(latent_2x, ts_2x, encoder_hidden_states=ctx).sample
+            eps_u, eps_c = eps_2x.chunk(2, dim=0)
             eps = eps_u + cfg_scale * (eps_c - eps_u)
         else:
-            eps = eps_c
+            eps = model.unet(latent, ts, encoder_hidden_states=ctx).sample
         latent = scheduler.step(eps, t, latent).prev_sample
     return model.decode_latent_to_image(latent)
 
@@ -368,6 +372,10 @@ def main():
                     help="override image_decoder.batch_size (SD UNet needs much smaller batch than ConvT)")
     ap.add_argument("--iteration-unit", default=None, choices=["image", "caption"],
                     help="dataset iteration unit. image=118k/ep (default), caption=590k/ep (5x time)")
+    ap.add_argument("--cache-dir", default=None,
+                    help="override cfg['cache_dir']. Stage 2 (Standard CLIP) 시 사용.")
+    ap.add_argument("--run-name-suffix", default="",
+                    help="run_name 에 붙일 suffix (예: 'std_clip'). encoder 종류 추적용.")
     args = ap.parse_args()
 
     cfg = load_config(args.config, args.decoder_config)
@@ -390,10 +398,11 @@ def main():
 
     device = torch.device(f"cuda:{img_cfg['device_id']}" if torch.cuda.is_available() else "cpu")
     coco_root = resolve_path(cfg["coco_root"], HERE)
-    cache_dir = resolve_path(cfg["cache_dir"], HERE)
+    cache_dir = resolve_path(args.cache_dir if args.cache_dir else cfg["cache_dir"], HERE)
     runs_root = resolve_path(cfg["runs_root"], HERE)
+    print(f"[cache_dir] {cache_dir}")
 
-    run_name = build_run_name(img_cfg, suffix="img")
+    run_name = build_run_name(img_cfg, suffix="img", name_suffix=args.run_name_suffix)
     run_dir = runs_root / run_name
     ckpt_dir = run_dir / "checkpoints"
     sample_dir = run_dir / "samples"
