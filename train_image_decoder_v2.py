@@ -92,8 +92,12 @@ def build_run_name(d_cfg: dict, suffix: str) -> str:
 class ImageDecoderDatasetV2(Dataset):
     """Yield dict per sample: {x, z, gt_caption, cached_caption_or_empty, z_kind}.
 
-    image-wise iteration이라 한 epoch=n_images (118k train). 매 sample마다 random.choice로
-    image의 5 captions 중 k를 뽑아 사용 → 매 epoch 다른 k가 나와 caption diversity 자동 보장.
+    iteration_unit:
+      - "image" (default, 118k/epoch train): 매 sample마다 image i의 5 captions 중 random k를
+        뽑아 사용 → 매 epoch 다른 k가 나와 caption diversity 자동 보장. wall-clock ~51분/epoch.
+      - "caption" (590k/epoch train): 매 sample이 특정 caption j와 그 부모 image. 한 image가
+        epoch당 5번 (5 captions로) 노출 → caption diversity 명시적, image load도 5번. wall-clock
+        ~4.2h/epoch (5배).
 
     Caption stream:
       - text_decoder_run이 비어있으면 cached_*가 모두 빈 문자열 → caption stream OFF.
@@ -106,10 +110,13 @@ class ImageDecoderDatasetV2(Dataset):
                  z_img: torch.Tensor, z_txt: torch.Tensor,
                  transform: T.Compose, z_source: str,
                  captions_zimg_cache: list[str] | None = None,
-                 captions_ztxt_cache: list[str] | None = None):
+                 captions_ztxt_cache: list[str] | None = None,
+                 iteration_unit: str = "image"):
         assert z_source in ("centroid", "modality", "random_img_txt")
+        assert iteration_unit in ("image", "caption")
         self.image_dir = image_dir
         self.image_ids = image_ids
+        self.caption_image_idx = caption_image_idx
         self.caption_texts = caption_texts
         self.transform = transform
         self.z_img = z_img        # (N_img, D)
@@ -117,8 +124,10 @@ class ImageDecoderDatasetV2(Dataset):
         self.z_source = z_source
         self.captions_zimg_cache = captions_zimg_cache
         self.captions_ztxt_cache = captions_ztxt_cache
+        self.iteration_unit = iteration_unit
 
-        # Group captions by parent image index.
+        # Group captions by parent image index (image-wise iteration용; caption-wise도
+        # 검증용으로 동일하게 생성하지만 사용 안 함).
         per_img: list[list[int]] = [[] for _ in image_ids]
         for cap_j, im_idx in enumerate(caption_image_idx):
             per_img[im_idx].append(cap_j)
@@ -126,21 +135,28 @@ class ImageDecoderDatasetV2(Dataset):
         self.captions_for_image = per_img
 
     def __len__(self) -> int:
-        return len(self.valid)
+        if self.iteration_unit == "image":
+            return len(self.valid)
+        return len(self.caption_texts)
 
     def _file(self, iid: int) -> Path:
         return self.image_dir / f"{iid:012d}.jpg"
 
     def __getitem__(self, k: int):
-        i = self.valid[k]
+        if self.iteration_unit == "image":
+            i = self.valid[k]
+            cap_indices = self.captions_for_image[i]
+            # torch.randint: DataLoader가 worker마다 seed 자동 분기.
+            cap_pos = torch.randint(len(cap_indices), (1,)).item()
+            cap_j = cap_indices[cap_pos]
+        else:  # caption-wise: k가 caption index 그대로
+            cap_j = k
+            i = self.caption_image_idx[cap_j]
+
         iid = self.image_ids[i]
         img = Image.open(self._file(iid)).convert("RGB")
         x = self.transform(img)
 
-        cap_indices = self.captions_for_image[i]
-        # torch.randint: DataLoader가 worker마다 seed 자동 분기 (random/numpy는 명시 필요).
-        cap_pos = torch.randint(len(cap_indices), (1,)).item()
-        cap_j = cap_indices[cap_pos]
         z_v = self.z_img[i].float()
         z_t = self.z_txt[cap_j].float()
 
@@ -203,6 +219,85 @@ def select_captions(batch: dict, *, use_cached: bool, caption_stream_on: bool) -
 
 # ---------------------------------------------------------------------------
 # DDIM inference helper for samples
+
+@torch.no_grad()
+def fetch_val_samples_all_z(val_ds: "ImageDecoderDatasetV2", n: int,
+                            device: torch.device, dtype: torch.dtype) -> dict:
+    """Fetch n val samples returning x_gt + z_img + z_txt + cached caps for both modes.
+
+    학습 시 random sampling과 달리 inference에서는 동일 image에 대한 zimg/ztxt를 모두 보고
+    싶기 때문에 별도 fetch helper로 분리. caption-wise iteration도 image-wise iteration도
+    image i의 첫 caption(captions_for_image[i][0])을 selection convention으로 사용.
+    """
+    xs, z_imgs, z_txts, gt_caps, zimg_caps, ztxt_caps = [], [], [], [], [], []
+    n_actual = min(n, len(val_ds.valid))
+    for k in range(n_actual):
+        i = val_ds.valid[k]
+        iid = val_ds.image_ids[i]
+        img = Image.open(val_ds._file(iid)).convert("RGB")
+        xs.append(val_ds.transform(img))
+        cap_j = val_ds.captions_for_image[i][0]
+        z_imgs.append(val_ds.z_img[i].float())
+        z_txts.append(val_ds.z_txt[cap_j].float())
+        gt_caps.append(val_ds.caption_texts[cap_j])
+        zimg_caps.append(val_ds.captions_zimg_cache[i] if val_ds.captions_zimg_cache else "")
+        ztxt_caps.append(val_ds.captions_ztxt_cache[cap_j] if val_ds.captions_ztxt_cache else "")
+    return {
+        "x_gt": torch.stack(xs).to(device).to(dtype),
+        "z_img": torch.stack(z_imgs).to(device),
+        "z_txt": torch.stack(z_txts).to(device),
+        "gt_caps": gt_caps,
+        "zimg_caps": zimg_caps,
+        "ztxt_caps": ztxt_caps,
+    }
+
+
+@torch.no_grad()
+def generate_epoch_inference_grids(model: DiffusionImageDecoder, scheduler,
+                                    val_ds: "ImageDecoderDatasetV2", epoch: int,
+                                    sample_dir: Path, device: torch.device,
+                                    dtype: torch.dtype, sample_steps: int = 30,
+                                    n: int = 8, use_cached_caption: bool = True,
+                                    caption_stream_on: bool = True) -> Path:
+    """Save 9 combos (3 z_source × 3 cfg_scale) per-epoch under sample_dir/epoch_NNN/.
+
+    z_source: random (per-sample 50/50 zimg vs ztxt), zimg (image-side), ztxt (text-side)
+    cfg_scale: 1.0 (no guidance), 3.0 (SD standard), 7.5 (SD web demo default)
+
+    각 PNG는 (top n=GT, bottom n=복원) grid. 학습 process와 동일 흐름으로 caption 결정:
+    epoch < curriculum_epochs이면 GT caption, else cached ĉ (zimg_caps or ztxt_caps).
+    """
+    epoch_dir = sample_dir / f"epoch_{epoch:03d}"
+    epoch_dir.mkdir(parents=True, exist_ok=True)
+
+    s = fetch_val_samples_all_z(val_ds, n=n, device=device, dtype=dtype)
+    n_actual = s["z_img"].size(0)
+
+    # Default 6 combos: zimg/ztxt × cfg 1.0/3.0/7.5. random은 평균/혼합 효과만 보여
+    # 평가 가치 적음 — 학습 default 동작 reproduction이 필요하면 wandb 대표 sample을 별도로 생성.
+    z_sources = [
+        ("zimg", s["z_img"], s["zimg_caps"]),
+        ("ztxt", s["z_txt"], s["ztxt_caps"]),
+    ]
+    cfg_scales = [1.0, 3.0, 7.5]
+
+    for zsrc_name, z_in, cached_caps in z_sources:
+        for cfg_scale in cfg_scales:
+            if not caption_stream_on:
+                captions_for_inf = None
+            elif use_cached_caption:
+                captions_for_inf = [c if c else g
+                                    for c, g in zip(cached_caps, s["gt_caps"])]
+            else:
+                captions_for_inf = s["gt_caps"]
+            x_hat = sample_images(model, scheduler, z_in, captions_for_inf,
+                                  n_steps=sample_steps, cfg_scale=cfg_scale)
+            grid = torch.cat([denorm(s["x_gt"]).float().cpu(),
+                              denorm(x_hat).float().cpu()], dim=0)
+            out_path = epoch_dir / f"recon_{zsrc_name}_cfg{cfg_scale}.png"
+            vutils.save_image(grid, out_path, nrow=n_actual, padding=2)
+    return epoch_dir
+
 
 @torch.no_grad()
 def sample_images(model: DiffusionImageDecoder, scheduler, z: torch.Tensor,
@@ -271,6 +366,8 @@ def main():
     ap.add_argument("--lora-rank", type=int, default=None)
     ap.add_argument("--batch-size", type=int, default=None,
                     help="override image_decoder.batch_size (SD UNet needs much smaller batch than ConvT)")
+    ap.add_argument("--iteration-unit", default=None, choices=["image", "caption"],
+                    help="dataset iteration unit. image=118k/ep (default), caption=590k/ep (5x time)")
     args = ap.parse_args()
 
     cfg = load_config(args.config, args.decoder_config)
@@ -285,6 +382,8 @@ def main():
         img_cfg["lora_rank"] = args.lora_rank
     if args.batch_size is not None:
         img_cfg["batch_size"] = args.batch_size
+    if args.iteration_unit is not None:
+        img_cfg["iteration_unit"] = args.iteration_unit
 
     random.seed(img_cfg["seed"])
     torch.manual_seed(img_cfg["seed"])
@@ -365,6 +464,7 @@ def main():
         print(f"[sanity] capped train images to {n}, captions to {len(kept_cap_idx)}")
 
     transform = make_pixel_transform()
+    iteration_unit = img_cfg.get("iteration_unit", "image")
     train_ds = ImageDecoderDatasetV2(
         coco_root / "images" / "train2017",
         idx["train"]["image_ids"],
@@ -374,6 +474,7 @@ def main():
         transform, img_cfg["z_source"],
         captions_zimg_cache=captions_zimg_train,
         captions_ztxt_cache=captions_ztxt_train,
+        iteration_unit=iteration_unit,
     )
     val_ds = ImageDecoderDatasetV2(
         coco_root / "images" / "val2017",
@@ -384,8 +485,9 @@ def main():
         transform, img_cfg["z_source"],
         captions_zimg_cache=captions_zimg_val,
         captions_ztxt_cache=captions_ztxt_val,
+        iteration_unit=iteration_unit,
     )
-    print(f"[data] train={len(train_ds)}, val={len(val_ds)}")
+    print(f"[data] iteration_unit={iteration_unit}, train={len(train_ds)}, val={len(val_ds)}")
 
     train_loader = DataLoader(train_ds, batch_size=img_cfg["batch_size"], shuffle=True,
                               num_workers=img_cfg["num_workers"], drop_last=True,
@@ -491,31 +593,28 @@ def main():
         wb_epoch = {"train_epoch/eps_mse": train_avg, **val_metrics, "epoch": epoch + 1}
         wandb.log(wb_epoch, step=global_step)
 
-        # Sample 8 val images (slow — 30-step DDIM); log every N epochs
+        # Per-epoch 9 inference grids (3 z_source × 3 cfg). 학습 throughput ~2% overhead.
+        # 파일: samples/epoch_NNN/recon_{random,zimg,ztxt}_cfg{1.0,3.0,7.5}.png
+        model.eval()
+        epoch_sample_dir = generate_epoch_inference_grids(
+            model, ddim, val_ds, epoch + 1, sample_dir, device, dtype,
+            sample_steps=sample_steps, n=8,
+            use_cached_caption=use_cached_this_epoch,
+            caption_stream_on=caption_stream_on,
+        )
+
+        # Wandb upload — 매 epoch 6장 다 올리면 dashboard 폭주. 대표 2장만 upload:
+        # zimg+cfg3.0 (in-modal baseline) + ztxt+cfg3.0 (cross-modal swap, contribution 핵심).
         log_samples = ((epoch + 1) %
                        max(int(wb_cfg.get("log_samples_every_n_epochs", 1)), 1) == 0)
         if log_samples:
-            model.eval()
-            with torch.no_grad():
-                v_batch = next(iter(val_loader))
-                z_s = v_batch["z"][:8].to(device)
-                x_s = v_batch["x"][:8].to(device)
-                cap_s = select_captions(
-                    {k: v[:8] if isinstance(v, list) else v for k, v in v_batch.items()},
-                    use_cached=use_cached_this_epoch,
-                    caption_stream_on=caption_stream_on,
-                )
-                x_hat = sample_images(model, ddim, z_s, cap_s,
-                                      n_steps=sample_steps,
-                                      cfg_scale=cfg_scale_sample)
-                grid = torch.cat([denorm(x_s).float().cpu(),
-                                  denorm(x_hat).float().cpu()], dim=0)
-                sample_path = sample_dir / f"epoch_{epoch+1:03d}.png"
-                vutils.save_image(grid, sample_path, nrow=8, padding=2)
-                wandb.log({"samples/val_grid": wandb.Image(
-                    str(sample_path),
-                    caption=f"epoch {epoch+1}: top=GT, bottom=recon (cap={cap_mode})",
-                )}, step=global_step)
+            for tag in ("zimg", "ztxt"):
+                rep_path = epoch_sample_dir / f"recon_{tag}_cfg3.0.png"
+                if rep_path.exists():
+                    wandb.log({f"samples/{tag}_cfg3.0": wandb.Image(
+                        str(rep_path),
+                        caption=f"epoch {epoch+1}: {tag}+cfg3.0 (cap={cap_mode})",
+                    )}, step=global_step)
 
         # Checkpoint — LoRA + z_proj only (frozen modules는 sd_model_id로 재로드)
         if (epoch + 1) % img_cfg["save_every_n_epochs"] == 0 or (epoch + 1) == img_cfg["epochs"]:

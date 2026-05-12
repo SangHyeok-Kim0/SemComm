@@ -139,6 +139,77 @@ Caption stream (M3):
 Trainable: UNet cross-attn LoRA (rank 8) + projection MLP = 약 19M params. VAE/text encoder/base UNet 모두 frozen.
 Loss: ε-prediction MSE in VAE latent (28×28×4). pixel-level metric은 미사용.
 
+**매 epoch 자동 6-inference grid**: 학습 중 매 epoch 끝마다 `samples/epoch_NNN/` 폴더가 생성되고 그 안에 **2 z_source × 3 cfg = 6 PNG**가 저장됨 — `recon_{zimg,ztxt}_cfg{1.0,3.0,7.5}.png`. 학습 throughput ~1.5% overhead (epoch당 ~50초 추가).
+- 학습 과정 추적 (epoch별 reconstruction quality 변화)
+- **zimg vs ztxt 페어가 cross-modal swap (modality-agnostic) 검증의 핵심** — random은 평균 효과라 평가 가치 적어 제외 (학습 default 동작 reproduction이 필요하면 `infer_image_decoder_v2.py --include-random`)
+- wandb dashboard에는 대표 2장(`zimg+cfg3.0`, `ztxt+cfg3.0`) `log_samples_every_n_epochs` 주기로 업로드
+
+### Step 4c — v2 학습 중간 / 종료 후 inference (`infer_image_decoder_v2.py`)
+
+매 epoch 저장된 `epoch_NNN.pt` ckpt로 즉시 sample image 생성. 학습 process와 GPU 공유 가능 (~5GB 추가). 학습 끝 기다리지 않고 진행 상황을 시각적으로 추적하거나, z_source/CFG ablation을 빠르게 시도하는 도구. 모든 명령은 **workspace 디렉터리**(`/workspace`)에서 실행.
+
+```bash
+# 추천: 6 combos 한 번에 (zimg/ztxt × cfg 1.0/3.0/7.5 = 6 PNG) — train 매 epoch 자동 출력과 동일 구조
+python Code/SemComm/infer_image_decoder_v2.py \
+    --run-dir runs/imgdiff_random_img_txt_capON_bs16_lr0.0001_r8_20260511-153122 \
+    --ckpt epoch_004.pt --all-combos --n 8 --seed 26
+# 산출: samples/epoch_003/recon_{zimg,ztxt}_cfg{1.0,3.0,7.5}_seed42.png (6개)
+
+# random z_source 포함 시 9 PNG (학습 default 동작 reproduction용)
+python Code/SemComm/infer_image_decoder_v2.py \
+    --run-dir runs/... --ckpt epoch_003.pt --all-combos --include-random --n 8
+```
+
+옵션별 사용 예시 (모두 workspace에서 실행):
+
+```bash
+# Single inference — z_source 1개 × cfg 1개
+python Code/SemComm/infer_image_decoder_v2.py \
+    --run-dir runs/imgdiff_..._<ts> --ckpt epoch_005.pt \
+    --z-source zimg --cfg-scale 3.0 --n 8
+
+# Random sample selection (재현 가능한 random seed 지정)
+python Code/SemComm/infer_image_decoder_v2.py \
+    --run-dir runs/imgdiff_..._<ts> --ckpt epoch_005.pt \
+    --all-combos --n 8 --seed 42
+
+# Caption stream 끄기 (M3 ablation)
+python Code/SemComm/infer_image_decoder_v2.py \
+    --run-dir runs/imgdiff_..._<ts> --ckpt epoch_010.pt --no-caption
+
+# GT caption 사용 (curriculum 단계의 동작 재현)
+python Code/SemComm/infer_image_decoder_v2.py \
+    --run-dir runs/imgdiff_..._<ts> --ckpt epoch_005.pt --use-gt-caption
+```
+
+CLI 옵션 요약:
+| 옵션 | 의미 | default |
+|---|---|---|
+| `--ckpt` | run dir의 checkpoints/ 아래 파일명 | `final.pt` |
+| `--n` | 생성할 sample 개수 | 8 |
+| `--batch-size` | DDIM 배치 크기 | 8 |
+| `--z-source` | `random` (50/50) / `zimg` / `ztxt` / `centroid` | `random` |
+| `--steps` | DDIM step 수 | 30 |
+| `--cfg-scale` | classifier-free guidance scale | 1.0 |
+| `--all-combos` | 6 PNG (zimg/ztxt × cfg) 한 번에. `--include-random`이면 9 PNG | — |
+| `--include-random` | `--all-combos`에 random z_source 추가 (학습 default 동작 reproduction) | — |
+| `--seed` | val image random 선택 시드 (미지정 시 sequential 첫 n개) | None (sequential) |
+| `--no-caption` | caption stream 강제 OFF | — |
+| `--use-gt-caption` | cached ĉ 대신 GT caption 사용 | — |
+| `--output` | output PNG 경로 override (single inference만) | auto |
+
+Sample selection 동작:
+- **`--seed` 미지정**: sorted val image indices의 첫 n개 (예: index 0, 1, 2, ..., n-1). 매번 같은 GT 8장.
+- **`--seed N` 지정**: `torch.randperm(N_val_images, seed=N)`으로 shuffle 후 첫 n개. 같은 seed면 재현 가능, 다른 seed면 다른 sample.
+- 각 image의 첫 caption(`caption_image_idx[j]==i` 만족하는 첫 j)을 convention으로 사용. z_txt 인덱스 j와 captions_ztxt[j], z_img 인덱스 i와 captions_zimg[i]가 정확히 매칭.
+
+파일명에 `z_source / cap on-off / cfg_scale`가 모두 박혀 있어 여러 조합 돌려도 덮어쓰기 없음. ckpt도 다르면 `samples/epoch_001/`, `samples/epoch_005/` 분리 저장 → epoch별 quality 변화 시각 추적 가능.
+
+추천 사용 시점:
+- epoch 1 ckpt 생성 직후 → `--all-combos`로 9 combo quick check
+- caption curriculum 끝(epoch 6+) → cached ĉ로 swap된 후 quality 변화 확인
+- 학습 종료 후 → `--seed N`로 여러 sample set에서 cross-modal swap 일관성 정량 비교
+
 ### Step 5 — 시각화 & 평가
 
 ```bash
@@ -160,13 +231,22 @@ python Code/SemComm/eval_captions.py --run-dir runs/txt_..._<ts>
 runs/<run_name>/
 ├── config.json                # 학습 시작 시 cfg dump (text_decoder_run 등 dependency 기록)
 ├── checkpoints/
-│   ├── epoch_NNN.pt
-│   └── final.pt
-├── samples/                   # image: PNG (위=GT, 아래=복원), text: GT/GEN .txt
+│   ├── epoch_NNN.pt           # save_every_n_epochs 주기로 저장
+│   └── final.pt               # 학습 종료 시
+├── samples/
+│   ├── epoch_001/             # v2: 매 epoch별 폴더, 9 PNG (3 z_source × 3 cfg)
+│   │   ├── recon_random_cfg1.0.png
+│   │   ├── recon_random_cfg3.0.png
+│   │   ├── recon_random_cfg7.5.png
+│   │   ├── recon_zimg_cfg{1.0,3.0,7.5}.png
+│   │   └── recon_ztxt_cfg{1.0,3.0,7.5}.png
+│   ├── epoch_002/ ...
+│   └── infer_*.png            # infer_image_decoder_v2.py로 수동 생성한 PNG
 ├── wandb/                     # wandb 로컬 캐시
 └── metrics.json               # epoch별 train/val 손실
 ```
 
+v1(ConvT)의 `samples/`는 단일 `epoch_NNN.png` (15 sample grid). v2는 위 9-combo 폴더 구조.
 v2 image decoder의 ckpt는 LoRA state + z_proj만 저장 (frozen 모듈은 sd_model_id로 재로드).
 
 ## Dependency Tracking (image decoder ↔ text decoder)
