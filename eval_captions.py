@@ -179,8 +179,7 @@ def main():
     ap.add_argument("--n", type=int, default=None,
                     help="evaluate on first N val images (default: all 5000)")
     ap.add_argument("--scenarios", nargs="+",
-                    default=["image", "text_mean", "text_random",
-                            "centroid_mean", "centroid_random"],
+                    default=["image", "text_random"],
                     choices=["image", "text_mean", "text_random",
                             "centroid_mean", "centroid_random"])
     ap.add_argument("--batch-size", type=int, default=32)
