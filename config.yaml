@@ -11,7 +11,7 @@
 # text_decoder.py는 decoder-config 불필요 (config.yaml만 읽음).
 
 # ---------- 공유: 인코더 / 데이터 / wandb ----------
-encoder_run: "bs128_lr1e-4_ep100_Tfix_fp16_a50-50_b20-50_20260505-034844"
+encoder_run: "RN50_bs128_lr1e-4_ep100_Tlearn_fp16_20260514-090547"
 encoder_model: "RN50"                # open_clip 모델 이름 (Run 1과 일치)
 encoder_ckpt_filename: "final.pt"    # ModalityGap runs/<run>/checkpoints/<filename>
 
@@ -47,6 +47,8 @@ text_decoder:
   precision: "bf16"                  # fp32 | fp16 | bf16. mapper(fp32 master) 연산을 amp_dtype로 cast. fp32면 autocast 비활성.
   num_workers: 4
   save_every_n_epochs: 2             # epochs 짧아진 만큼 빈도 ↑
+  eval_metrics_every_n_epochs: 2     # BLEU/CIDEr 측정 주기 (val subset)
+  eval_metrics_n_samples: 500        # BLEU/CIDEr 측정 시 val subset 크기 (full은 비싸서 subset 권장)
   run_name: "auto"
 
   # Architecture & generation

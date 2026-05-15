@@ -55,7 +55,11 @@ def load_run_assets(run_dir: Path, ckpt_name: str, device: torch.device,
         cfg = json.load(f)
     text_cfg = cfg["text_decoder"]
 
-    print(f"[model] loading from {run_dir}/checkpoints/{ckpt_name} ...")
+    # 새 구조: checkpoints/models/<ckpt>, 옛 구조: checkpoints/<ckpt> 둘 다 지원.
+    ckpt_path = run_dir / "checkpoints" / "models" / ckpt_name
+    if not ckpt_path.exists():
+        ckpt_path = run_dir / "checkpoints" / ckpt_name
+    print(f"[model] loading from {ckpt_path} ...")
     model = TextDecoder(
         lm_name=text_cfg["lm_name"],
         z_dim=1024,
@@ -67,8 +71,7 @@ def load_run_assets(run_dir: Path, ckpt_name: str, device: torch.device,
         freeze_lm=text_cfg["freeze_lm"],
         lm_dtype=text_cfg.get("lm_dtype", "auto"),
     ).to(device)
-    ckpt = torch.load(run_dir / "checkpoints" / ckpt_name,
-                      map_location=device, weights_only=False)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.mapper.load_state_dict(ckpt["mapper"])
     model.eval()
 

@@ -82,7 +82,10 @@ def main():
     print(f"[cache_dir] {cache_dir}")
     runs_root = resolve_path(cfg["runs_root"], HERE)
     run_dir = runs_root / args.text_decoder_run
-    ckpt_path = run_dir / "checkpoints" / "final.pt"
+    # 새 구조: checkpoints/models/final.pt, 옛 구조: checkpoints/final.pt 둘 다 지원.
+    ckpt_path = run_dir / "checkpoints" / "models" / "final.pt"
+    if not ckpt_path.exists():
+        ckpt_path = run_dir / "checkpoints" / "final.pt"
     if not ckpt_path.exists():
         raise FileNotFoundError(f"text decoder final.pt not found: {ckpt_path}")
 

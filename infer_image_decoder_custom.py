@@ -72,7 +72,10 @@ def load_clip_encoder(cfg: dict, device: torch.device):
 
 def load_text_decoder(text_decoder_run: str, device: torch.device) -> TextDecoder:
     """Rebuild TextDecoder from saved ckpt (mirrors encode_captions.py)."""
-    ckpt_path = HERE / "runs" / text_decoder_run / "checkpoints" / "final.pt"
+    # 새 구조: checkpoints/models/final.pt, 옛 구조: checkpoints/final.pt 둘 다 지원.
+    ckpt_path = HERE / "runs" / text_decoder_run / "checkpoints" / "models" / "final.pt"
+    if not ckpt_path.exists():
+        ckpt_path = HERE / "runs" / text_decoder_run / "checkpoints" / "final.pt"
     if not ckpt_path.exists():
         raise FileNotFoundError(f"text decoder ckpt not found: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
