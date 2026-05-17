@@ -11,6 +11,7 @@
 z source policy (v2):
   centroid:       mu = normalize((z_img + z_txt) / 2)
   modality:       z = z_img
+  ztxt:           z = z_txt[k] (random k of image's 5 captions)
   random_img_txt: per-sample 50/50 — z = z_img[i] or z = z_txt[k] (random k of image's 5 captions)
 
 Run artifacts: runs/<run_name>/{config.json, checkpoints/*.pt, samples/, metrics.json}
@@ -113,7 +114,7 @@ class ImageDecoderDatasetV2(Dataset):
                  captions_zimg_cache: list[str] | None = None,
                  captions_ztxt_cache: list[str] | None = None,
                  iteration_unit: str = "image"):
-        assert z_source in ("centroid", "modality", "random_img_txt")
+        assert z_source in ("centroid", "modality", "ztxt", "random_img_txt")
         assert iteration_unit in ("image", "caption")
         self.image_dir = image_dir
         self.image_ids = image_ids
@@ -164,6 +165,9 @@ class ImageDecoderDatasetV2(Dataset):
         if self.z_source == "modality":
             z = z_v
             z_kind = "zimg"
+        elif self.z_source == "ztxt":
+            z = z_t
+            z_kind = "ztxt"
         elif self.z_source == "random_img_txt":
             if torch.rand(1).item() < 0.5:
                 z = z_v
@@ -223,17 +227,35 @@ def select_captions(batch: dict, *, use_cached: bool, caption_stream_on: bool) -
 
 @torch.no_grad()
 def fetch_val_samples_all_z(val_ds: "ImageDecoderDatasetV2", n: int,
-                            device: torch.device, dtype: torch.dtype) -> dict:
-    """Fetch n val samples returning x_gt + z_img + z_txt + cached caps for both modes.
+                            device: torch.device, dtype: torch.dtype,
+                            seed: int = 7,
+                            coco_image_ids: list[int] | None = None) -> dict:
+    """Fetch val samples returning x_gt + z_img + z_txt + cached caps for both modes.
 
-    학습 시 random sampling과 달리 inference에서는 동일 image에 대한 zimg/ztxt를 모두 보고
-    싶기 때문에 별도 fetch helper로 분리. caption-wise iteration도 image-wise iteration도
-    image i의 첫 caption(captions_for_image[i][0])을 selection convention으로 사용.
+    selection priority:
+      coco_image_ids 지정 시: 그 image_id들만 사용 (n, seed 무시). val cache에 없으면 raise.
+      그 외: seed로 val.valid를 deterministic shuffle → 첫 n개 선택.
+
+    image_i의 첫 caption(captions_for_image[i][0])을 convention으로 사용.
     """
     xs, z_imgs, z_txts, gt_caps, zimg_caps, ztxt_caps = [], [], [], [], [], []
-    n_actual = min(n, len(val_ds.valid))
-    for k in range(n_actual):
-        i = val_ds.valid[k]
+    if coco_image_ids:
+        coco_id_to_idx = {iid: idx for idx, iid in enumerate(val_ds.image_ids)}
+        missing = [iid for iid in coco_image_ids if iid not in coco_id_to_idx]
+        if missing:
+            raise ValueError(f"COCO image_id not in val cache: {missing}")
+        valid_set = set(val_ds.valid)
+        selected = [coco_id_to_idx[iid] for iid in coco_image_ids]
+        no_cap = [iid for iid, i in zip(coco_image_ids, selected) if i not in valid_set]
+        if no_cap:
+            raise ValueError(f"COCO image_id has no caption (not in valid set): {no_cap}")
+        indices = selected
+    else:
+        n_actual = min(n, len(val_ds.valid))
+        g = torch.Generator().manual_seed(int(seed))
+        perm = torch.randperm(len(val_ds.valid), generator=g).tolist()[:n_actual]
+        indices = [val_ds.valid[k] for k in perm]
+    for i in indices:
         iid = val_ds.image_ids[i]
         img = Image.open(val_ds._file(iid)).convert("RGB")
         xs.append(val_ds.transform(img))
@@ -259,52 +281,82 @@ def generate_epoch_inference_grids(model: DiffusionImageDecoder, scheduler,
                                     sample_dir: Path, device: torch.device,
                                     dtype: torch.dtype, sample_steps: int = 30,
                                     n: int = 8, use_cached_caption: bool = True,
-                                    caption_stream_on: bool = True) -> Path:
-    """Save 9 combos (3 z_source × 3 cfg_scale) per-epoch under sample_dir/epoch_NNN/.
+                                    caption_stream_on: bool = True,
+                                    cfg_scales=(3.0, 5.0, 7.0),
+                                    seed: int = 7,
+                                    noise_seed: int | None = 7,
+                                    coco_image_ids: list[int] | None = None,
+                                    all_combos: bool = True,
+                                    z_source: str = "ztxt") -> Path:
+    """Save grids per-epoch under sample_dir/epoch_NNN/.
 
-    z_source: random (per-sample 50/50 zimg vs ztxt), zimg (image-side), ztxt (text-side)
-    cfg_scale: 1.0 (no guidance), 3.0 (SD standard), 7.5 (SD web demo default)
+    파일명:
+      all_combos=True  → paired_nseed{seed}_cfg{int}.png (GT/zimg/ztxt 3 rows)
+      all_combos=False → {z_source}_nseed{seed}_cfg{int}.png (GT/recon 2 rows, 학습 z_source 단일)
 
-    각 PNG는 (top n=GT, bottom n=복원) grid. 학습 process와 동일 흐름으로 caption 결정:
-    epoch < curriculum_epochs이면 GT caption, else cached ĉ (zimg_caps or ztxt_caps).
+    caption 선택은 학습 흐름과 동일: epoch < curriculum_epochs면 GT, 이후 cached ĉ.
+    coco_image_ids 지정 시 그 image들만 사용 (seed/n 무시).
+    noise_seed 지정 시 diffusion 초기 latent noise도 deterministic.
     """
     epoch_dir = sample_dir / f"epoch_{epoch:03d}"
     epoch_dir.mkdir(parents=True, exist_ok=True)
 
-    s = fetch_val_samples_all_z(val_ds, n=n, device=device, dtype=dtype)
+    s = fetch_val_samples_all_z(val_ds, n=n, device=device, dtype=dtype,
+                                seed=seed, coco_image_ids=coco_image_ids)
     n_actual = s["z_img"].size(0)
 
-    # Default 6 combos: zimg/ztxt × cfg 1.0/3.0/7.5. random은 평균/혼합 효과만 보여
-    # 평가 가치 적음 — 학습 default 동작 reproduction이 필요하면 wandb 대표 sample을 별도로 생성.
-    z_sources = [
-        ("zimg", s["z_img"], s["zimg_caps"]),
-        ("ztxt", s["z_txt"], s["ztxt_caps"]),
-    ]
-    cfg_scales = [1.0, 3.0, 7.5]
+    def _select_caps(cached_caps):
+        if not caption_stream_on:
+            return None
+        if use_cached_caption:
+            return [c if c else g for c, g in zip(cached_caps, s["gt_caps"])]
+        return s["gt_caps"]
 
-    for zsrc_name, z_in, cached_caps in z_sources:
-        for cfg_scale in cfg_scales:
-            if not caption_stream_on:
-                captions_for_inf = None
-            elif use_cached_caption:
-                captions_for_inf = [c if c else g
-                                    for c, g in zip(cached_caps, s["gt_caps"])]
-            else:
-                captions_for_inf = s["gt_caps"]
-            x_hat = sample_images(model, scheduler, z_in, captions_for_inf,
-                                  n_steps=sample_steps, cfg_scale=cfg_scale)
+    zimg_caps_for_inf = _select_caps(s["zimg_caps"])
+    ztxt_caps_for_inf = _select_caps(s["ztxt_caps"])
+
+    for cfg_scale in cfg_scales:
+        cfg_int = int(round(cfg_scale))
+        if all_combos:
+            x_zimg = sample_images(model, scheduler, s["z_img"], zimg_caps_for_inf,
+                                   n_steps=sample_steps, cfg_scale=cfg_scale,
+                                   noise_seed=noise_seed)
+            x_ztxt = sample_images(model, scheduler, s["z_txt"], ztxt_caps_for_inf,
+                                   n_steps=sample_steps, cfg_scale=cfg_scale,
+                                   noise_seed=noise_seed)
+            grid = torch.cat([denorm(s["x_gt"]).float().cpu(),
+                              denorm(x_zimg).float().cpu(),
+                              denorm(x_ztxt).float().cpu()], dim=0)
+            out_path = epoch_dir / f"paired_nseed{seed}_cfg{cfg_int}.png"
+        else:
+            # 학습 z_source 단일 grid.
+            if z_source == "ztxt":
+                z_in, caps = s["z_txt"], ztxt_caps_for_inf
+            elif z_source == "modality":  # zimg
+                z_in, caps = s["z_img"], zimg_caps_for_inf
+            elif z_source == "centroid":
+                z_in = F.normalize((s["z_img"] + s["z_txt"]) / 2.0, dim=-1)
+                caps = s["gt_caps"] if caption_stream_on else None
+            else:  # random / unsupported → ztxt fallback
+                z_in, caps = s["z_txt"], ztxt_caps_for_inf
+            x_hat = sample_images(model, scheduler, z_in, caps,
+                                  n_steps=sample_steps, cfg_scale=cfg_scale,
+                                  noise_seed=noise_seed)
             grid = torch.cat([denorm(s["x_gt"]).float().cpu(),
                               denorm(x_hat).float().cpu()], dim=0)
-            out_path = epoch_dir / f"recon_{zsrc_name}_cfg{cfg_scale}.png"
-            vutils.save_image(grid, out_path, nrow=n_actual, padding=2)
+            out_path = epoch_dir / f"{z_source}_nseed{seed}_cfg{cfg_int}.png"
+        vutils.save_image(grid, out_path, nrow=n_actual, padding=2)
     return epoch_dir
 
 
 @torch.no_grad()
 def sample_images(model: DiffusionImageDecoder, scheduler, z: torch.Tensor,
                   captions: list[str] | None, n_steps: int,
-                  cfg_scale: float = 1.0) -> torch.Tensor:
-    """Return decoded images in [-1, 1]. cfg_scale=1.0 = no CFG (just conditioned)."""
+                  cfg_scale: float = 1.0,
+                  noise_seed: int | None = None) -> torch.Tensor:
+    """Return decoded images in [-1, 1]. cfg_scale=1.0 = no CFG (just conditioned).
+    noise_seed: 지정 시 latent 초기 noise를 deterministic하게 생성 (epoch 간 같은 시드면
+    같은 noise → cfg/시점 비교 가능)."""
     device = z.device
     B = z.size(0)
     scheduler.set_timesteps(n_steps)
@@ -314,7 +366,11 @@ def sample_images(model: DiffusionImageDecoder, scheduler, z: torch.Tensor,
     cond = model.build_condition(z, captions)
     ctx = torch.cat([torch.zeros_like(cond), cond], dim=0) if use_cfg else cond
 
-    latent = torch.randn(B, 4, 28, 28, device=device, dtype=model.dtype)
+    if noise_seed is not None:
+        g = torch.Generator(device=device).manual_seed(int(noise_seed))
+        latent = torch.randn(B, 4, 28, 28, generator=g, device=device, dtype=model.dtype)
+    else:
+        latent = torch.randn(B, 4, 28, 28, device=device, dtype=model.dtype)
     for t in scheduler.timesteps:
         ts = torch.tensor([t.item()] * B, device=device).long()
         if use_cfg:
@@ -327,6 +383,95 @@ def sample_images(model: DiffusionImageDecoder, scheduler, z: torch.Tensor,
             eps = model.unet(latent, ts, encoder_hidden_states=ctx).sample
         latent = scheduler.step(eps, t, latent).prev_sample
     return model.decode_latent_to_image(latent)
+
+
+# ---------------------------------------------------------------------------
+# CLIP-based + pixel-based per-epoch quantitative metrics
+# CLIPScore = raw cosine(I_gen, T_gt) — eval_image.py 정의와 일관 (compare_image_decoders.py도 동일).
+# PSNR: standard pixel-level signal-to-noise.
+
+# CLIP encoder는 standard CLIP (openai pretrained) — 학습한 encoder가 아닌 외부 기준.
+_CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+_CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
+
+def _clip_preprocess(x_01: torch.Tensor) -> torch.Tensor:
+    """[0,1] images (B,3,H,W) → CLIP input (B,3,224,224) with mean/std normalize."""
+    x = F.interpolate(x_01, size=(224, 224), mode="bilinear", align_corners=False)
+    mean = torch.tensor(_CLIP_MEAN, device=x.device).view(1, 3, 1, 1)
+    std = torch.tensor(_CLIP_STD, device=x.device).view(1, 3, 1, 1)
+    return (x - mean) / std
+
+
+@torch.no_grad()
+def compute_epoch_metrics(
+    model: DiffusionImageDecoder, scheduler, val_ds: "ImageDecoderDatasetV2",
+    device: torch.device, dtype: torch.dtype,
+    *,
+    clip_model, clip_tokenizer,
+    n_samples: int, cfg_scale: float, sample_steps: int,
+    eval_seed: int, noise_seed: int | None,
+    use_cached_caption: bool, caption_stream_on: bool,
+    z_source: str,
+    batch_size: int = 16,
+) -> dict:
+    """Generate n_samples val images at single cfg_scale on the training z_source only,
+    compute CLIPScore (gen ↔ GT caption) + PSNR (gen ↔ GT image). Mean over samples.
+    학습 안 한 modality는 측정 안 함 (낭비).
+    """
+    s = fetch_val_samples_all_z(val_ds, n=n_samples, device=device, dtype=dtype,
+                                seed=eval_seed)
+    n_actual = s["z_img"].size(0)
+
+    def _select_caps(cached_caps):
+        if not caption_stream_on:
+            return None
+        if use_cached_caption:
+            return [c if c else g for c, g in zip(cached_caps, s["gt_caps"])]
+        return s["gt_caps"]
+
+    # 학습 z_source 기준 단일 modality만 평가.
+    if z_source == "ztxt":
+        z_in, caps_in = s["z_txt"], _select_caps(s["ztxt_caps"])
+    elif z_source == "modality":  # zimg
+        z_in, caps_in = s["z_img"], _select_caps(s["zimg_caps"])
+    elif z_source == "centroid":
+        z_in = F.normalize((s["z_img"] + s["z_txt"]) / 2.0, dim=-1)
+        caps_in = s["gt_caps"] if caption_stream_on else None
+    else:  # random / fallback → ztxt
+        z_in, caps_in = s["z_txt"], _select_caps(s["ztxt_caps"])
+
+    outs = []
+    for i in range(0, n_actual, batch_size):
+        zb = z_in[i:i + batch_size]
+        cb = caps_in[i:i + batch_size] if caps_in is not None else None
+        x = sample_images(model, scheduler, zb, cb,
+                          n_steps=sample_steps, cfg_scale=cfg_scale,
+                          noise_seed=noise_seed)
+        outs.append(x)
+    x_gen = torch.cat(outs, dim=0)
+
+    # PSNR — [0,1] pixels.
+    gt_01 = denorm(s["x_gt"]).float()
+    g01 = denorm(x_gen).float()
+    mse = (g01 - gt_01).pow(2).flatten(1).mean(dim=1).clamp(min=1e-10)
+    psnr = (10.0 * torch.log10(1.0 / mse)).mean().item()
+
+    # CLIPScore (raw cosine — eval_image.py 정의와 일관) — image emb (gen) vs text emb (GT caption).
+    text_tokens = clip_tokenizer(s["gt_caps"]).to(device)
+    text_feat = clip_model.encode_text(text_tokens)
+    text_feat = text_feat / text_feat.norm(dim=-1, keepdim=True)
+    img_feat = clip_model.encode_image(_clip_preprocess(g01))
+    img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
+    cs = (img_feat * text_feat).sum(dim=-1).mean().item()
+
+    return {
+        "n_samples": n_actual,
+        "cfg_scale": cfg_scale,
+        "z_source":  z_source,
+        f"clipscore/{z_source}": round(cs, 4),
+        f"psnr/{z_source}":      round(psnr, 4),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +509,7 @@ def main():
                     help="cap train images for sanity dry-run")
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--z-source", default=None,
-                    choices=["centroid", "modality", "random_img_txt"])
+                    choices=["centroid", "modality", "ztxt", "random_img_txt"])
     ap.add_argument("--text-decoder-run", default=None,
                     help="override image_decoder.text_decoder_run (caption stream selector)")
     ap.add_argument("--lora-rank", type=int, default=None)
@@ -436,23 +581,52 @@ def main():
     # Caption stream selector
     text_decoder_run = img_cfg.get("text_decoder_run", "") or ""
     caption_stream_on = bool(text_decoder_run)
+
+    # Sync encoder fields from text decoder's training config (single source of truth).
+    # text decoder run의 config.json에 학습 당시 encoder_run 등이 그대로 dump되어 있어,
+    # image decoder가 어떤 encoder의 z 위에서 동작하는지 자동 일치시킬 수 있다.
+    if text_decoder_run:
+        td_config_path = runs_root / text_decoder_run / "config.json"
+        if td_config_path.exists():
+            with open(td_config_path) as f:
+                td_cfg = json.load(f)
+            for key in ("encoder_run", "encoder_model", "encoder_ckpt_filename"):
+                if key in td_cfg:
+                    if cfg.get(key) and cfg[key] != td_cfg[key]:
+                        print(f"[sync] {key}: base={cfg[key]!r} → {td_cfg[key]!r} "
+                              f"(from text decoder run config)")
+                    cfg[key] = td_cfg[key]
+        else:
+            print(f"[sync] skipped — text decoder config.json not found at {td_config_path}")
     captions_zimg_train = captions_ztxt_train = None
     captions_zimg_val = captions_ztxt_val = None
     if caption_stream_on:
         print(f"[caption] stream ON — loading cache for text_decoder_run={text_decoder_run!r}")
         prefix = f"captions_{text_decoder_run}"
-        for name in ["train_zimg", "train_ztxt", "val_zimg", "val_ztxt"]:
+        # z_source에 따라 필요한 caption 종류만 require. centroid는 gt_caption fallback (line 184).
+        z_src = img_cfg["z_source"]
+        needs_zimg = z_src in ("modality", "random_img_txt")
+        needs_ztxt = z_src in ("ztxt", "random_img_txt")
+        required = ([n for n in ("train_zimg", "val_zimg") if needs_zimg]
+                    + [n for n in ("train_ztxt", "val_ztxt") if needs_ztxt])
+        for name in required:
             p = cache_dir / f"{prefix}_{name}.pt"
             if not p.exists():
                 raise FileNotFoundError(
                     f"caption cache missing: {p}\n"
-                    f"Run encode_captions.py --text-decoder-run {text_decoder_run} first.")
-        captions_zimg_train = torch.load(cache_dir / f"{prefix}_train_zimg.pt", weights_only=False)
-        captions_ztxt_train = torch.load(cache_dir / f"{prefix}_train_ztxt.pt", weights_only=False)
-        captions_zimg_val   = torch.load(cache_dir / f"{prefix}_val_zimg.pt", weights_only=False)
-        captions_ztxt_val   = torch.load(cache_dir / f"{prefix}_val_ztxt.pt", weights_only=False)
-        print(f"[caption] loaded: zimg_train={len(captions_zimg_train)}, "
-              f"ztxt_train={len(captions_ztxt_train)}")
+                    f"Run encode_captions.py --text-decoder-run {text_decoder_run} --zkinds "
+                    f"{'ztxt' if needs_ztxt else 'zimg'} first.")
+
+        def _load_opt(name):
+            p = cache_dir / f"{prefix}_{name}.pt"
+            return torch.load(p, weights_only=False) if p.exists() else None
+
+        captions_zimg_train = _load_opt("train_zimg")
+        captions_ztxt_train = _load_opt("train_ztxt")
+        captions_zimg_val   = _load_opt("val_zimg")
+        captions_ztxt_val   = _load_opt("val_ztxt")
+        print(f"[caption] loaded: zimg_train={len(captions_zimg_train) if captions_zimg_train else 'None'}, "
+              f"ztxt_train={len(captions_ztxt_train) if captions_ztxt_train else 'None'}")
     else:
         print("[caption] stream OFF (text_decoder_run empty) — z만 conditioning")
 
@@ -469,6 +643,7 @@ def main():
         idx["train"]["caption_texts"] = kept_cap_texts
         if captions_zimg_train is not None:
             captions_zimg_train = captions_zimg_train[:n]
+        if captions_ztxt_train is not None:
             captions_ztxt_train = captions_ztxt_train[: len(kept_cap_idx)]
         print(f"[sanity] capped train images to {n}, captions to {len(kept_cap_idx)}")
 
@@ -542,11 +717,43 @@ def main():
 
     curriculum_epochs = int(img_cfg.get("caption_curriculum_epochs", 0))
     cond_drop_prob = float(img_cfg.get("cond_drop_prob", 0.1))
-    cfg_scale_sample = float(img_cfg.get("cfg_scale_sample", 1.0))
     sample_steps = int(img_cfg.get("sample_steps", 30))
+    sample_seed = int(img_cfg.get("sample_seed", 7))
+    sample_n = int(img_cfg.get("sample_n", 12))
+    sample_all_combos = bool(img_cfg.get("sample_all_combos", True))
+    _ns = img_cfg.get("sample_noise_seed", 7)
+    sample_noise_seed = None if _ns is None else int(_ns)
+    sample_coco_image_ids = img_cfg.get("sample_coco_image_ids") or None
+    sample_cfg_scales = list(img_cfg.get("sample_cfg_scales", [3.0, 5.0, 7.0]))
     print(f"[train] caption_curriculum_epochs={curriculum_epochs}, "
           f"cond_drop_prob={cond_drop_prob}, sample_steps={sample_steps}, "
-          f"cfg_scale_sample={cfg_scale_sample}")
+          f"sample_seed={sample_seed}, sample_n={sample_n}, "
+          f"sample_all_combos={sample_all_combos}, "
+          f"sample_noise_seed={sample_noise_seed}, "
+          f"sample_coco_image_ids={sample_coco_image_ids}, "
+          f"sample_cfg_scales={sample_cfg_scales}")
+
+    # CLIP-based metric eval (optional, every epoch)
+    metric_eval_n = int(img_cfg.get("metric_eval_n", 0))
+    metric_eval_cfg = float(img_cfg.get("metric_eval_cfg", 3.0))
+    metric_eval_seed = int(img_cfg.get("metric_eval_seed", 42))
+    _mez = img_cfg.get("metric_eval_z_source", "ztxt")
+    metric_eval_z_sources = list(_mez) if isinstance(_mez, list) else [_mez]
+    clip_model = clip_tokenizer = None
+    if metric_eval_n > 0:
+        import open_clip  # lazy import — only when metric eval enabled
+        clip_model_name = img_cfg.get("metric_clip_model", "RN50")
+        clip_pretrained = img_cfg.get("metric_clip_pretrained", "openai")
+        print(f"[metric] loading CLIP {clip_model_name} ({clip_pretrained}) for CLIPScore ...")
+        clip_model, _, _ = open_clip.create_model_and_transforms(
+            clip_model_name, pretrained=clip_pretrained, device=device,
+        )
+        clip_model.eval()
+        for p in clip_model.parameters():
+            p.requires_grad = False
+        clip_tokenizer = open_clip.get_tokenizer(clip_model_name)
+        print(f"[metric] eval_n={metric_eval_n}, cfg={metric_eval_cfg}, "
+              f"seed={metric_eval_seed}, z_sources={metric_eval_z_sources}")
 
     metrics_log: list[dict] = []
     global_step = 0
@@ -602,28 +809,46 @@ def main():
         wb_epoch = {"train_epoch/eps_mse": train_avg, **val_metrics, "epoch": epoch + 1}
         wandb.log(wb_epoch, step=global_step)
 
-        # Per-epoch 9 inference grids (3 z_source × 3 cfg). 학습 throughput ~2% overhead.
-        # 파일: samples/epoch_NNN/recon_{random,zimg,ztxt}_cfg{1.0,3.0,7.5}.png
+        # Per-epoch paired inference grids (GT/zimg/ztxt rows × cfg_scales 종류).
+        # 파일: samples/epoch_NNN/paired_nseed{seed}_cfg{int}.png
         model.eval()
         epoch_sample_dir = generate_epoch_inference_grids(
             model, ddim, val_ds, epoch + 1, sample_dir, device, dtype,
-            sample_steps=sample_steps, n=8,
+            sample_steps=sample_steps, n=sample_n,
             use_cached_caption=use_cached_this_epoch,
             caption_stream_on=caption_stream_on,
+            cfg_scales=sample_cfg_scales, seed=sample_seed,
+            noise_seed=sample_noise_seed,
+            coco_image_ids=sample_coco_image_ids,
+            all_combos=sample_all_combos,
+            z_source=img_cfg["z_source"],
         )
 
-        # Wandb upload — 매 epoch 6장 다 올리면 dashboard 폭주. 대표 2장만 upload:
-        # zimg+cfg3.0 (in-modal baseline) + ztxt+cfg3.0 (cross-modal swap, contribution 핵심).
-        log_samples = ((epoch + 1) %
-                       max(int(wb_cfg.get("log_samples_every_n_epochs", 1)), 1) == 0)
-        if log_samples:
-            for tag in ("zimg", "ztxt"):
-                rep_path = epoch_sample_dir / f"recon_{tag}_cfg3.0.png"
-                if rep_path.exists():
-                    wandb.log({f"samples/{tag}_cfg3.0": wandb.Image(
-                        str(rep_path),
-                        caption=f"epoch {epoch+1}: {tag}+cfg3.0 (cap={cap_mode})",
-                    )}, step=global_step)
+        # Quantitative metric eval (CLIPScore + PSNR). 결과 → samples/epoch_NNN/metrics.json + wandb.
+        if clip_model is not None:
+            combined = {"epoch": epoch + 1, "n_samples": metric_eval_n,
+                        "cfg_scale": metric_eval_cfg,
+                        "z_sources": list(metric_eval_z_sources)}
+            for zsrc in metric_eval_z_sources:
+                m = compute_epoch_metrics(
+                    model, ddim, val_ds, device, dtype,
+                    clip_model=clip_model, clip_tokenizer=clip_tokenizer,
+                    n_samples=metric_eval_n, cfg_scale=metric_eval_cfg,
+                    sample_steps=sample_steps,
+                    eval_seed=metric_eval_seed, noise_seed=sample_noise_seed,
+                    use_cached_caption=use_cached_this_epoch,
+                    caption_stream_on=caption_stream_on,
+                    z_source=zsrc,
+                )
+                for k, v in m.items():
+                    if k.startswith("clipscore/") or k.startswith("psnr/"):
+                        combined[k] = v
+            with open(epoch_sample_dir / "metrics.json", "w") as f:
+                json.dump(combined, f, indent=2)
+            print(f"  [metric] " + " ".join(
+                f"{k}={v}" for k, v in combined.items() if "/" in k))
+            wandb.log({f"metric/{k}": v for k, v in combined.items() if "/" in k},
+                      step=global_step)
 
         # Checkpoint — LoRA + z_proj only (frozen modules는 sd_model_id로 재로드)
         if (epoch + 1) % img_cfg["save_every_n_epochs"] == 0 or (epoch + 1) == img_cfg["epochs"]:

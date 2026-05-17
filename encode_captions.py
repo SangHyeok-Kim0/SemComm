@@ -63,7 +63,7 @@ def main():
                     help="text decoder run name under runs/ (e.g. txt_random_img_txt_..._)")
     ap.add_argument("--batch-size", type=int, default=128,
                     help="generate batch size (Qwen3-0.6B on GB10 handles 128 comfortably)")
-    ap.add_argument("--beam-size", type=int, default=1,
+    ap.add_argument("--beam-size", type=int, default=5,
                     help="1=greedy (fast). Caption diversity matters less for conditioning than speed.")
     ap.add_argument("--max-new-tokens", type=int, default=20,
                     help="COCO caption 95th-percentile ~25 token, 20 covers most")
@@ -71,6 +71,10 @@ def main():
                     help="regenerate even if cache file already exists")
     ap.add_argument("--cache-dir", default=None,
                     help="override cfg['cache_dir']. Stage 2 (Standard CLIP) 시 사용.")
+    ap.add_argument("--zkinds", nargs="+", default=["zimg", "ztxt"],
+                    choices=["zimg", "ztxt"],
+                    help="which z-kind(s) to generate captions for. "
+                         "ztxt-only 학습이면 'ztxt'만 지정해 시간 절약.")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -121,12 +125,14 @@ def main():
     model.eval()
 
     prefix = f"captions_{args.text_decoder_run}"
-    targets = [
+    all_targets = [
         ("train z_img", z_img_train, "train", "zimg"),
         ("train z_txt", z_txt_train, "train", "ztxt"),
         ("val z_img",   z_img_val,   "val",   "zimg"),
         ("val z_txt",   z_txt_val,   "val",   "ztxt"),
     ]
+    targets = [t for t in all_targets if t[3] in args.zkinds]
+    print(f"[zkinds] generating: {args.zkinds}")
     for label, z_all, split, zkind in targets:
         out_path = cache_dir / f"{prefix}_{split}_{zkind}.pt"
         if out_path.exists() and not args.overwrite:

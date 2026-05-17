@@ -9,7 +9,7 @@
 
 image_decoder:
   # Training
-  z_source: "random_img_txt"         # centroid | modality | random_img_txt (proposed: random_img_txt)
+  z_source: "ztxt"         # centroid | modality (=z_img) | ztxt (=z_txt) | random_img_txt (proposed: random_img_txt)
   iteration_unit: "image"            # image (118k/ep, 매 epoch random caption 선택) | caption (590k/ep, 5x time per epoch)
   batch_size: 16                     # SD UNet은 ConvT보다 활성 메모리 큼 — BS 16~32 권장
   epochs: 20                         # 50k step ≈ 수렴. caption curriculum 5 + cached ĉ 5 epoch
@@ -26,7 +26,7 @@ image_decoder:
   # text_decoder_run이 비어있으면 caption stream OFF (= M3 off cell, z만 conditioning).
   # 비어있지 않으면 encode_captions.py가 생성한 cache/captions_{text_decoder_run}_{split}_{zkind}.pt를 로드.
   # 학습 run의 config.json에 자동 기록되어 어떤 text decoder에 의존했는지 사후 추적 가능.
-  text_decoder_run: "txt_centroid_bs64_lr2e-05_K10_20260510-150610"               # 예: "txt_centroid_bs64_lr2e-05_K10_20260510-150610" (파일럿)
+  text_decoder_run: "txt_modality_bs64_lr2e-05_K10_std_clip_20260515-100435"               # 예: "txt_centroid_bs64_lr2e-05_K10_20260510-150610" (파일럿)
                                      #     또는 "txt_random_img_txt_..." (재학습 후 권장)
   caption_curriculum_epochs: 5       # 처음 N epoch는 GT caption 사용, 이후 cached ĉ로 swap (0이면 즉시 ĉ), image-wise 5 → caption-wise 1로
 
@@ -35,4 +35,19 @@ image_decoder:
   n_z_tokens: 10                     # z 1024-D를 K virtual tokens × 768-D로 project (cross-attn input).
   cond_drop_prob: 0.1                # classifier-free guidance 위한 학습 시 condition drop 확률.
   sample_steps: 30                   # validation sample inference DDIM step 수.
-  cfg_scale_sample: 1.0              # inference 시 CFG scale (1.0 = guidance 없음, 3.0~7.5 권장 in ablation).
+ 
+  sample_seed: 7                     # val sample 선택 random seed (재현용, 파일명에 nseed{seed}로 기록).
+  sample_n: 12                       # grid 당 sample 수 (한 row의 column 수).
+  sample_all_combos: true            # true=paired (GT/zimg/ztxt 3 rows). false=학습 z_source 단일 (GT/recon 2 rows).
+  sample_noise_seed: 7               # diffusion latent noise seed (재현용). null이면 매번 다름.
+  sample_coco_image_ids: null        # 특정 COCO image_id 리스트 (e.g. [397133, 458755]). null이면 sample_seed로 random pick.
+  sample_cfg_scales: [1.0,3.0, 5.0] # 매 epoch 저장할 paired grid의 cfg scale 종류.
+  cfg_scale_sample: 3.0              # inference 시 CFG scale (1.0 = guidance 없음, 3.0~7.5 권장 in ablation).
+
+  # Per-epoch quantitative metric eval (CLIPScore + PSNR). 0이면 skip.
+  metric_eval_n: 200                 # eval용 sample 수 (variance vs 시간 tradeoff)
+  metric_eval_cfg: 3.0               # eval 시 사용할 단일 cfg scale
+  metric_eval_seed: 42               # eval val sample 선택 seed (sample_seed와 분리)
+  metric_eval_z_source: "ztxt"       # metric 측정에 쓸 z_source. 단일 "ztxt"|"modality"(=zimg)|"centroid", 또는 list (예: ["ztxt","modality"]). 학습 z_source와 무관, 명시 선택.
+  metric_clip_model: "RN50"          # open_clip 모델 이름
+  metric_clip_pretrained: "openai"   # standard CLIP baseline (학습된 encoder 아님 — fair metric)

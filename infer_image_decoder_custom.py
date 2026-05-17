@@ -45,7 +45,7 @@ CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 
 
 def encoder_transform() -> T.Compose:
-    """Same as encode_dataset.py — CLIP preprocessing (mean/std)."""
+    """Same as encode_embeddings.py — CLIP preprocessing (mean/std)."""
     return T.Compose([
         T.Resize((224, 224)),
         T.ToTensor(),
@@ -54,7 +54,7 @@ def encoder_transform() -> T.Compose:
 
 
 def load_clip_encoder(cfg: dict, device: torch.device):
-    """Mirrors encode_dataset.load_encoder."""
+    """Mirrors encode_embeddings.load_encoder."""
     model_name = cfg["encoder_model"]
     ckpt_path = MODGAP / "runs" / cfg["encoder_run"] / "checkpoints" / cfg["encoder_ckpt_filename"]
     model, _, _ = open_clip.create_model_and_transforms(model_name, pretrained=None, device=device)

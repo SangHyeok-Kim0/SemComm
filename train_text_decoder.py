@@ -471,32 +471,6 @@ def main():
                 "epoch": total_epochs, "config": cfg},
                model_dir / "final.pt")
 
-    # 최종 combined chart 들 — 각 metric 마다 zimg vs ztxt 한 panel 에 같이 plot.
-    # eval_metrics/epoch_NNN.json 파일들에서 history 모아서 wandb.plot.line_series 로 log.
-    eval_jsons = sorted(eval_metrics_dir.glob("epoch_*.json"))
-    if eval_jsons:
-        history = []
-        for p in eval_jsons:
-            with open(p) as f:
-                history.append(json.load(f))
-        epochs_x = [e["epoch"] for e in history]
-        # BLEU 2/4 는 wandb 시각화에서 제외 (JSON 에는 저장됨, 사후 분석 가능).
-        metric_keys = [k for k in history[0]["zimg"].keys()
-                       if k in ("BLEU-1", "BLEU-3", "ROUGE-L", "CIDEr")]
-        combined = {}
-        for mk in metric_keys:
-            zimg_ys = [e["zimg"].get(mk, 0.0) for e in history]
-            ztxt_ys = [e["ztxt"].get(mk, 0.0) for e in history]
-            combined[f"eval/combined_{mk}"] = wandb.plot.line_series(
-                xs=epochs_x,
-                ys=[zimg_ys, ztxt_ys],
-                keys=["zimg", "ztxt"],
-                title=f"{mk} — zimg vs ztxt",
-                xname="epoch",
-            )
-        wandb.log(combined)
-        print(f"[wandb] logged {len(metric_keys)} combined charts (zimg vs ztxt per metric)")
-
     wandb.finish()
     print(f"\n[done] saved to {run_dir}")
 

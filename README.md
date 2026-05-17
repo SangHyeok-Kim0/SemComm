@@ -28,7 +28,7 @@ image decoder 학습 스크립트는 `--config config.yaml --decoder-config <con
 - `train_image_decoder.py` → `config_convt.yaml`
 - `train_image_decoder_v2.py` → `config_diffusion.yaml`
 
-`train_text_decoder.py` / `encode_captions.py` / `encode_dataset.py`는 `config.yaml` 한 파일만 읽음.
+`train_text_decoder.py` / `encode_captions.py` / `encode_embeddings.py`는 `config.yaml` 한 파일만 읽음.
 
 ## Phase A — Decoder-swap 가능성 진단 (학습 없음)
 
@@ -44,13 +44,13 @@ python Code/SemComm/phase_a_diagnose.py
 
 ```bash
 # 전체 (train ~118k images / ~590k captions, val ~5k / ~25k)
-python Code/SemComm/encode_dataset.py
+python Code/SemComm/encode_embeddings.py
 
 # 샘플 (smoke test)
-python Code/SemComm/encode_dataset.py --max-images 256 --splits train val
+python Code/SemComm/encode_embeddings.py --max-images 256 --splits train val
 
 # Stage 2 — Standard CLIP (OpenAI pretrained, gap≈0.5) 별도 cache
-python Code/SemComm/encode_dataset.py \
+python Code/SemComm/encode_embeddings.py \
     --encoder-mode standard_clip \
     --cache-dir Code/SemComm/cache_std_clip
 ```
@@ -379,7 +379,7 @@ v2 image decoder의 M3 caption stream이 text decoder의 generate 출력에 의�
 
 ```bash
 # 0. (1회) embeddings cache
-python encode_dataset.py
+python encode_embeddings.py
 
 # 1. text decoder (random_img_txt, ~1.5h)
 python train_text_decoder.py
@@ -407,7 +407,7 @@ Stage 1 결과 확인 후 Standard CLIP encoder 로 같은 protocol 반복 → m
 
 ```bash
 # 0. Standard CLIP 임베딩 cache (별도 디렉토리)
-python Code/SemComm/encode_dataset.py \
+python Code/SemComm/encode_embeddings.py \
     --encoder-mode standard_clip \
     --cache-dir Code/SemComm/cache_std_clip
 
