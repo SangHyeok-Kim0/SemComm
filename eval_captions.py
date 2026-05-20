@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 
 import torch
+from PIL import Image
 from tqdm import tqdm
 
 HERE = Path(__file__).resolve().parent
@@ -156,9 +157,72 @@ def compute_metrics(gts: dict[int, list[str]],
 
 
 # ---------------------------------------------------------------------------
+# CLIPScore (semantic) — standard CLIP image-text cosine.
+# eval_image.py와 동일하게 raw cosine 사용 (clamp/scale 없음).
+# 학습된 encoder가 아닌 별도 OpenAI CLIP을 metric으로 사용 → fair.
+
+_CLIP_BUNDLE = None  # (model, preprocess, tokenizer, device)
+
+
+def load_clip_metric(device: torch.device,
+                     model_name: str = "ViT-B-32",
+                     pretrained: str = "openai"):
+    global _CLIP_BUNDLE
+    if _CLIP_BUNDLE is not None:
+        return _CLIP_BUNDLE
+    import open_clip
+    print(f"[clip] loading {model_name} ({pretrained}) ...")
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        model_name, pretrained=pretrained, device=device
+    )
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+    tokenizer = open_clip.get_tokenizer(model_name)
+    _CLIP_BUNDLE = (model, preprocess, tokenizer, device)
+    return _CLIP_BUNDLE
+
+
+@torch.no_grad()
+def precompute_clip_img_feats(image_ids: list[int], sample_indices: list[int],
+                              coco_root: Path, device: torch.device,
+                              batch_size: int = 64) -> torch.Tensor:
+    """sample_indices에 해당하는 COCO val image들을 standard CLIP encoder로 인코딩 (한 번만)."""
+    model, preprocess, _, _ = load_clip_metric(device)
+    val_dir = coco_root / "images" / "val2017"
+    imgs = []
+    for i in tqdm(sample_indices, desc="clip img enc"):
+        iid = image_ids[i]
+        img = Image.open(val_dir / f"{iid:012d}.jpg").convert("RGB")
+        imgs.append(preprocess(img))
+    feats = []
+    for s in range(0, len(imgs), batch_size):
+        batch = torch.stack(imgs[s:s + batch_size]).to(device)
+        f = model.encode_image(batch)
+        f = f / f.norm(dim=-1, keepdim=True)
+        feats.append(f.float())
+    return torch.cat(feats, dim=0)
+
+
+@torch.no_grad()
+def compute_clip_score(img_feats: torch.Tensor, captions: list[str],
+                       device: torch.device, batch_size: int = 256) -> float:
+    """img_feats: (N, D) normalized. Generated caption별 cosine mean."""
+    model, _, tokenizer, _ = load_clip_metric(device)
+    txt_feats = []
+    for s in range(0, len(captions), batch_size):
+        tokens = tokenizer(captions[s:s + batch_size]).to(device)
+        f = model.encode_text(tokens)
+        f = f / f.norm(dim=-1, keepdim=True)
+        txt_feats.append(f.float())
+    txt_feats = torch.cat(txt_feats, dim=0)
+    return (img_feats * txt_feats).sum(-1).mean().item()
+
+
+# ---------------------------------------------------------------------------
 # Output formatting
 
-METRIC_ORDER = ["BLEU-1", "BLEU-2", "BLEU-3", "BLEU-4", "ROUGE-L", "CIDEr"]
+METRIC_ORDER = ["BLEU-1", "BLEU-2", "BLEU-3", "BLEU-4", "ROUGE-L", "CIDEr", "CLIPScore"]
 
 
 def format_markdown_table(metrics_by_scenario: dict[str, dict[str, float]]) -> str:
@@ -182,28 +246,40 @@ def main():
     ap.add_argument("--n", type=int, default=None,
                     help="evaluate on first N val images (default: all 5000)")
     ap.add_argument("--scenarios", nargs="+",
-                    default=["image", "text_random"],
+                    default=["text_random"],
                     choices=["image", "text_mean", "text_random",
                             "centroid_mean", "centroid_random"])
-    ap.add_argument("--batch-size", type=int, default=32)
+    ap.add_argument("--batch-size", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=2026)
     ap.add_argument("--no-clean", action="store_true",
                     help="첫 문장 cut 끄기 (raw beam output)")
     ap.add_argument("--config", default=str(HERE / "config.yaml"),
                     help="공유 cfg (cache_dir, coco_root)")
+    ap.add_argument("--cache-dir", default=None,
+                    help="override cfg['cache_dir']. text decoder가 학습된 cache와 동일해야 함.")
     ap.add_argument("--output", default=None,
                     help="JSON 경로 (default: <run-dir>/results/metric/eval_metrics[_snr<x>].json)")
     ap.add_argument("--noise-snr", type=float, nargs="+", default=None,
                     help="AWGN inject SNR_dB. 단일 또는 sweep. "
-                         "예: --noise-snr 20 10 0 -5. 미지정 → 무노이즈 1회.")
+                         "예: --noise-snr 10 0 -10 -15. 미지정 → 무노이즈 1회.")
+    ap.add_argument("--no-clip-score", action="store_true",
+                    help="skip CLIPScore (semantic) computation")
+    ap.add_argument("--clip-model", default="ViT-B-32",
+                    help="open_clip model for CLIPScore metric (eval_image.py와 동일)")
+    ap.add_argument("--clip-pretrained", default="openai",
+                    help="open_clip pretrained tag")
     args = ap.parse_args()
-    snr_list: list[float | None] = list(args.noise_snr) if args.noise_snr else [None]
+    # noise zero(None) baseline은 항상 측정 — SNR sweep과 비교 기준.
+    snr_list: list[float | None] = [None]
+    if args.noise_snr:
+        snr_list += [s for s in args.noise_snr if s is not None]
 
     run_dir = resolve_path(args.run_dir, HERE)
     with open(args.config) as f:
         import yaml
         shared_cfg = yaml.safe_load(f)
-    cache_dir = resolve_path(shared_cfg["cache_dir"], HERE)
+    cache_dir = resolve_path(args.cache_dir if args.cache_dir else shared_cfg["cache_dir"], HERE)
+    print(f"[cache_dir] {cache_dir}")
     coco_root = resolve_path(shared_cfg["coco_root"], HERE)
 
     # Device — text_cfg에서 device_id 가져옴
@@ -224,7 +300,16 @@ def main():
 
     gts = build_gt_refs(per_img_cap_idx, cap_texts, sample_indices)
 
+    # CLIPScore용 image feature 사전 계산 (한 번만, SNR/scenario 무관).
+    clip_img_feats = None
+    if not args.no_clip_score:
+        clip_img_feats = precompute_clip_img_feats(
+            image_ids, sample_indices, coco_root, device)
+        print(f"[clip] img feats: {tuple(clip_img_feats.shape)}")
+
     # SNR sweep: 각 SNR마다 5 시나리오 돌리고 별도 JSON 저장.
+    # snr→scenario→metrics 누적 (sweep 끝나면 PNG plot 생성).
+    sweep_results: dict[float | None, dict[str, dict[str, float]]] = {}
     for snr_db in snr_list:
         snr_tag = f"_snr{snr_db:g}" if snr_db is not None else ""
         print(f"\n=== SNR = {snr_db if snr_db is not None else 'no noise'} ===")
@@ -259,6 +344,9 @@ def main():
 
             res = build_gens_dict(gens)
             metrics = compute_metrics(gts, res)
+            if clip_img_feats is not None:
+                metrics["CLIPScore"] = compute_clip_score(
+                    clip_img_feats, gens, device)
             metrics_by_scenario[sc_key] = metrics
             predictions_by_scenario[sc_key] = [
                 {"image_idx": i, "image_id": image_ids[i],
@@ -297,6 +385,43 @@ def main():
         with open(out_path, "w") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
         print(f"[done] {out_path}")
+        sweep_results[snr_db] = metrics_by_scenario
+
+    # SNR sweep plot — 2개 이상 SNR 측정 시 자동 PNG 생성.
+    numeric_snrs = sorted(s for s in sweep_results if s is not None)
+    if len(numeric_snrs) >= 2:
+        import matplotlib.pyplot as plt
+        plot_dir = run_dir / "results" / "metric"
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        # 1x4 subplot — 메트릭별로 독립 axis.
+        panels = [("BLEU-1", "tab:blue"), ("BLEU-3", "tab:green"),
+                  ("CIDEr", "crimson"), ("CLIPScore", "tab:purple")]
+        baseline = sweep_results.get(None)
+        for sc in args.scenarios:
+            if not all(sc in sweep_results[s] for s in numeric_snrs):
+                continue
+            fig, axes = plt.subplots(1, len(panels), figsize=(4 * len(panels), 4))
+            for ax, (metric, color) in zip(axes, panels):
+                ys = [sweep_results[s][sc].get(metric, float("nan")) for s in numeric_snrs]
+                if all(y != y for y in ys):  # all NaN → skip
+                    ax.set_title(f"{metric} (N/A)")
+                    continue
+                ax.plot(numeric_snrs, ys, marker="o", color=color, linewidth=2)
+                if baseline and sc in baseline and metric in baseline[sc]:
+                    ax.axhline(y=baseline[sc][metric], color=color,
+                               linestyle="--", alpha=0.5, linewidth=1,
+                               label="no-noise")
+                    ax.legend(loc="best", fontsize=8)
+                ax.set_xlabel("SNR (dB)")
+                ax.set_ylabel(metric)
+                ax.set_title(metric)
+                ax.grid(True, alpha=0.3)
+            fig.suptitle(f"SNR sweep — {sc} (n={n}, dashed = no-noise)")
+            fig.tight_layout()
+            out_png = plot_dir / f"snr_sweep_{sc}.png"
+            fig.savefig(out_png, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            print(f"[plot] {out_png}")
 
 
 if __name__ == "__main__":

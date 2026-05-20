@@ -42,7 +42,7 @@ image_decoder:
   sample_noise_seed: 7               # diffusion latent noise seed (재현용). null이면 매번 다름.
   sample_coco_image_ids: null        # 특정 COCO image_id 리스트 (e.g. [397133, 458755]). null이면 sample_seed로 random pick.
   sample_cfg_scales: [1.0,3.0, 5.0] # 매 epoch 저장할 paired grid의 cfg scale 종류.
-  cfg_scale_sample: 3.0              # inference 시 CFG scale (1.0 = guidance 없음, 3.0~7.5 권장 in ablation).
+  cfg_scale_sample: 3.0              # infe                                                                                                                                           rence 시 CFG scale (1.0 = guidance 없음, 3.0~7.5 권장 in ablation).
 
   # Per-epoch quantitative metric eval (CLIPScore + PSNR). 0이면 skip.
   metric_eval_n: 200                 # eval용 sample 수 (variance vs 시간 tradeoff)
